@@ -17,6 +17,7 @@ An Arduino Mega 2560 samples ten Tekscan FlexiForce sensors at 100 Hz and stream
 | `flexiforce_logger.ino` | Arduino firmware. Samples all 10 channels at a fixed 100 Hz (4x oversampled per channel for noise reduction) and prints `time_ms,S1_V,...,S10_V` lines. Send `s` to start a run and `x` to stop. |
 | `collect_data.py` | Opens the serial port, starts a run, and writes the stream to `flexiforce_<timestamp>.csv`. Stops on Ctrl+C or after `--duration` seconds, and can plot the result automatically. |
 | `plot_data.py` | Quick-look voltage-vs-time plots of a saved CSV, as stacked subplots or overlaid on one axis. |
+| `live_view.py` | Real-time scrolling graph straight from the serial port, with each channel's mean and standard deviation over the visible window. Saves nothing to disk. |
 
 ## Setup
 
@@ -44,12 +45,28 @@ python collect_data.py --port COM7 --duration 30 --plot
 python collect_data.py --port COM7 --duration 30 --channels 1 3 --overlay
 ```
 
+Add `--stats` to print each channel's mean and standard deviation and show them on the plot (dashed line at the mean, shaded band at ±1 standard deviation). It works with `plot_data.py` too:
+
+```bash
+python collect_data.py --port COM7 --duration 30 --channels 1 --stats
+python plot_data.py run1.csv --channels 1 3 --stats
+```
+
 Plot a saved file:
 
 ```bash
 python plot_data.py run1.csv
 python plot_data.py run1.csv --channels 1 3 5 --overlay
 ```
+
+Watch the sensors live without saving a file (close the graph window to stop):
+
+```bash
+python live_view.py --port COM7
+python live_view.py --port COM7 --channels 1 3 --window 30
+```
+
+On the graph, the dashed line is the mean and the dotted lines are ±1 standard deviation, all computed over the visible window (`--window` seconds, default 10).
 
 ## Notes
 

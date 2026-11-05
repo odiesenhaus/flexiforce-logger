@@ -14,6 +14,7 @@ Usage:
     python collect_data.py --port COM5 --duration 60
     python collect_data.py --port COM5 --duration 60 --plot
     python collect_data.py --port COM5 --channels 1 3 --overlay
+    python collect_data.py --port COM5 --duration 30 --channels 1 --stats
 
 Press Ctrl+C to stop logging early -- the script will still close out
 the file cleanly and tell the Arduino to stop.
@@ -40,6 +41,8 @@ def parse_args():
                     help="Plot only these sensor numbers (1-10) when logging finishes. Implies --plot.")
     p.add_argument("--overlay", action="store_true",
                     help="Plot channels on one set of axes. Implies --plot.")
+    p.add_argument("--stats", action="store_true",
+                    help="Print each channel's mean and standard deviation, and show them on the plot. Implies --plot.")
     return p.parse_args()
 
 
@@ -107,13 +110,13 @@ def main():
         ser.close()
         print(f"Saved {rows_written} samples to {outfile}")
 
-    if args.plot or args.channels or args.overlay:
+    if args.plot or args.channels or args.overlay or args.stats:
         if rows_written == 0:
             print("No samples logged, skipping plot.")
             return
         # imported here so logging still works without pandas/matplotlib installed
         from plot_data import plot_csv
-        plot_csv(outfile, args.channels, args.overlay)
+        plot_csv(outfile, args.channels, args.overlay, args.stats)
 
 
 if __name__ == "__main__":
