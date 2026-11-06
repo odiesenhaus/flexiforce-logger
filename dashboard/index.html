@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlexiForce Dashboard</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>FlexiForce Dashboard</h1>
+    <span id="statusPill" class="pill"><span class="dot"></span><span id="statusText">Idle</span></span>
+    <span id="simBadge" class="pill warning" hidden>⚠ Simulated data</span>
+    <span id="quality" class="muted"></span>
+  </header>
+
+  <section class="controls" aria-label="Connection and recording">
+    <label class="field">Serial port
+      <span class="inline">
+        <select id="portSelect"></select>
+        <button id="refreshPorts" type="button" class="ghost">Refresh</button>
+      </span>
+    </label>
+    <label class="field">Run name (optional)
+      <input id="runLabel" type="text" maxlength="40" placeholder="e.g. grip_test_1">
+    </label>
+    <label class="field">Auto-stop (seconds)
+      <input id="autoStop" type="number" min="0" step="any" placeholder="Off">
+    </label>
+    <div class="actions">
+      <button id="recordButton" type="button" class="primary">Start recording</button>
+      <button id="connectButton" type="button">Live view only</button>
+      <button id="markerButton" type="button" title="Press M" disabled>Add marker (M)</button>
+    </div>
+    <p id="recStatus" class="rec-status" aria-live="polite"></p>
+  </section>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <section id="replayBar" class="replay" aria-label="Replay controls" hidden>
+    <strong>Replaying</strong>
+    <span id="replayName" class="filename"></span>
+    <button id="replayPlay" type="button">Pause</button>
+    <input id="replaySlider" type="range" min="0" max="1" step="0.01" value="0" aria-label="Replay position">
+    <span id="replayTime" class="numeric"></span>
+    <label class="inline">Speed
+      <select id="replaySpeed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="5">5×</option>
+      </select>
+    </label>
+    <button id="replayExit" type="button" class="ghost">Back to live</button>
+  </section>
+
+  <section class="filters" aria-label="Display options">
+    <label class="inline">Time window
+      <select id="windowSelect">
+        <option value="5">5 s</option>
+        <option value="10" selected>10 s</option>
+        <option value="30">30 s</option>
+        <option value="60">60 s</option>
+      </select>
+    </label>
+    <label class="inline">Colors show
+      <select id="colorMode">
+        <option value="live">Current value</option>
+        <option value="peak">Peak so far</option>
+      </select>
+    </label>
+    <button id="resetPeak" type="button" class="ghost" hidden>Reset peak</button>
+    <label class="inline">Color range
+      <input id="rangeMin" type="number" step="0.01" aria-label="Color range minimum">
+      <span class="muted">to</span>
+      <input id="rangeMax" type="number" step="0.01" aria-label="Color range maximum">
+      <span id="rangeUnit" class="muted"></span>
+    </label>
+    <button id="zeroButton" type="button" class="ghost" title="Treat the last second as the unloaded level. Only changes colors and the summary numbers; recordings stay raw.">Zero sensors</button>
+  </section>
+
+  <section class="tiles" aria-label="Summary">
+    <div class="tile"><span class="tile-label">Side balance</span><span id="tileBalance" class="tile-value">–</span><span id="tileBalanceSub" class="muted">Side A / Side B</span></div>
+    <div class="tile"><span class="tile-label">Side A load center</span><span id="tileCenterA" class="tile-value">–</span><span class="muted">From the middle sensor, + is up</span></div>
+    <div class="tile"><span class="tile-label">Side B load center</span><span id="tileCenterB" class="tile-value">–</span><span class="muted">From the middle sensor, + is up</span></div>
+    <div class="tile"><span class="tile-label">Highest sensor</span><span id="tilePeak" class="tile-value">–</span><span id="tileSaturated" class="muted">No sensors saturated</span></div>
+  </section>
+
+  <main class="layout">
+    <section class="card model-card">
+      <div class="card-head">
+        <h2>Cylinder</h2>
+        <div class="segmented" role="group" aria-label="Cylinder view">
+          <button type="button" data-view="angled" class="ghost">Angled</button>
+          <button type="button" data-view="sideA" class="ghost">Side A</button>
+          <button type="button" data-view="sideB" class="ghost">Side B</button>
+        </div>
+      </div>
+      <div class="model-body">
+        <div class="model-canvas-wrap">
+          <canvas id="modelCanvas" tabindex="0" role="img" aria-label="3D wireframe cylinder with sensors colored by value. Drag or use the arrow keys to rotate. The sensor table below has every value."></canvas>
+        </div>
+        <figure class="end-view">
+          <svg id="endView" viewBox="-2.75 -2.45 5.5 4.9" role="group" aria-label="End view of the cylinder showing all 10 sensors"></svg>
+          <figcaption id="endCaption" class="muted"></figcaption>
+        </figure>
+      </div>
+      <div class="scale-slot"></div>
+      <p class="muted hint">Drag to rotate. Click a sensor to add it to the chart.</p>
+    </section>
+
+    <section class="card heat-card">
+      <div class="card-head"><h2>Heat grid</h2></div>
+      <div id="heatGrid" class="heat-grid"></div>
+      <div class="scale-slot"></div>
+    </section>
+
+    <section class="card chart-card">
+      <div class="card-head">
+        <h2>History</h2>
+        <div id="chartLegend" class="legend"></div>
+      </div>
+      <div class="chart-wrap"><canvas id="chartCanvas" role="img" aria-label="Line chart of the selected sensors over time. The sensor table below has the same channels."></canvas></div>
+    </section>
+
+    <section class="card table-card">
+      <div class="card-head"><h2>Sensors</h2><span id="tableWindow" class="muted"></span></div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Chart</th>
+              <th scope="col">Sensor</th>
+              <th scope="col">Location</th>
+              <th scope="col" class="num">Now</th>
+              <th scope="col" class="num">Mean</th>
+              <th scope="col" class="num">Std dev</th>
+              <th scope="col" class="num">Min</th>
+              <th scope="col" class="num">Max</th>
+            </tr>
+          </thead>
+          <tbody id="sensorTable"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card recordings-card">
+      <div class="card-head">
+        <h2>Recordings</h2>
+        <button id="refreshRecordings" type="button" class="ghost">Refresh</button>
+      </div>
+      <p id="dataDir" class="muted filename"></p>
+      <div class="table-scroll recordings-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">File</th>
+              <th scope="col">Saved</th>
+              <th scope="col" class="num">Length</th>
+              <th scope="col" class="num">Size</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="recordingsTable"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
