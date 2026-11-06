@@ -16,10 +16,9 @@
   </header>
 
   <section class="controls" aria-label="Connection and recording">
-    <label class="field">Serial port
+    <label class="field">Sensor port
       <span class="inline">
         <select id="portSelect"></select>
-        <button id="refreshPorts" type="button" class="ghost">Refresh</button>
       </span>
     </label>
     <label class="field">Run name (optional)
@@ -34,6 +33,43 @@
       <button id="markerButton" type="button" title="Press M" disabled>Add marker (M)</button>
     </div>
     <p id="recStatus" class="rec-status" aria-live="polite"></p>
+  </section>
+
+  <section class="controls test-panel" aria-label="Automated gripper test">
+    <div class="test-head">
+      <h2>Gripper test</h2>
+      <span id="gripperPill" class="pill"><span class="dot"></span><span id="gripperText">Gripper not connected</span></span>
+      <span id="detectStatus" class="muted"></span>
+    </div>
+    <label class="field">Gripper port
+      <span class="inline">
+        <select id="gripperPort"></select>
+        <button id="gripperConnect" type="button" class="ghost">Connect</button>
+      </span>
+    </label>
+    <label class="field">Trials
+      <input id="testCycles" type="number" min="1" max="50" step="1" value="4">
+    </label>
+    <label class="field">Closed (s)
+      <input id="testClosed" type="number" min="2" max="600" step="any" value="10">
+    </label>
+    <label class="field">Open (s)
+      <input id="testOpen" type="number" min="2" max="600" step="any" value="10">
+    </label>
+    <label class="field" title="Time at the start of each closed and open phase left out of the statistics, while the gripper is still moving. It stays in the CSV.">Ignore first (s)
+      <input id="testSettle" type="number" min="0" max="600" step="any" value="4">
+    </label>
+    <div class="actions">
+      <button id="testButton" type="button" class="primary">Start test</button>
+      <button id="gripperOpen" type="button" disabled>Open gripper</button>
+      <button id="gripperClose" type="button" disabled>Close gripper</button>
+      <button id="findArduinos" type="button" class="ghost">Find Arduinos</button>
+    </div>
+    <div id="testProgress" class="test-progress" hidden>
+      <progress id="testProgressBar" max="1" value="0"></progress>
+      <span id="testProgressText" class="numeric" aria-live="polite"></span>
+    </div>
+    <p id="testMessage" class="rec-status" role="status"></p>
   </section>
 
   <div id="banner" class="banner" role="alert" hidden></div>
@@ -143,6 +179,27 @@
           <tbody id="sensorTable"></tbody>
         </table>
       </div>
+    </section>
+
+    <section id="resultsCard" class="card results-card" hidden>
+      <div class="card-head">
+        <h2>Test results</h2>
+        <label class="inline">Phase
+          <select id="resultsPhase">
+            <option value="closed">Closed</option>
+            <option value="open">Open</option>
+          </select>
+        </label>
+      </div>
+      <p id="resultsNote" class="muted hint"></p>
+      <div class="table-scroll">
+        <table>
+          <thead id="resultsHead"></thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+      <p id="resultsSaturated" class="hint" hidden>⚠ This sensor hit its maximum during the phase, so the true load may be higher than its mean shows.</p>
+      <div id="resultsFiles" class="result-files"></div>
     </section>
 
     <section class="card recordings-card">

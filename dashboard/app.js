@@ -1,6 +1,7 @@
 import {
   ARC_POSITIONS_IN, COLOR_RANGE, CYLINDER, SATURATION_LEVEL, SENSOR_HEAD_DIAMETER_IN, SIDES, UNIT, toDisplayUnits,
 } from "/config.js";
+import { initGripper } from "/gripper.js";
 import { CylinderView, VIEW_PRESETS } from "/model3d.js";
 
 const $ = (id) => document.getElementById(id);
@@ -889,10 +890,12 @@ function applyStatus(status) {
   const connectButton = $("connectButton");
   connectButton.textContent = running ? "Disconnect" : "Live view only";
   $("markerButton").disabled = status.state !== "live";
+  // a gripper test controls the recording itself until it finishes
+  recordButton.disabled = status.test.running;
+  connectButton.disabled = status.test.running;
   // the page can be reloaded mid-run, so the server's port is the one to show
   if (running && $("portSelect").value !== status.port) $("portSelect").value = status.port;
   $("portSelect").disabled = running;
-  $("refreshPorts").disabled = running;
 
   const recStatus = $("recStatus");
   if (recording) {
@@ -910,6 +913,7 @@ function applyStatus(status) {
     state.lastSavedFile = savedFile;
     refreshRecordings();
   }
+  gripper.update(status);
   renderBanner();
 }
 
@@ -922,47 +926,88 @@ function renderBanner() {
   banner.textContent = message || "";
 }
 
-async function refreshPorts() {
-  const select = $("portSelect");
-  const previous = select.value || loadSavedPort();
+async function refreshPorts({ likelyOnly = false } = {}) {
+  const sensorSelect = $("portSelect");
+  const gripperSelect = $("gripperPort");
+  const previousSensor = sensorSelect.value || loadSavedPort("flexiforce-port");
+  const previousGripper = gripperSelect.value || loadSavedPort("flexiforce-gripper-port");
   try {
-    const { ports, simulated_port: simulatedPort } = await (await fetch("/api/ports")).json();
-    const addOption = (value, text) => {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = text;
-      select.append(option);
+    const listing = await (await fetch("/api/ports")).json();
+    const fill = (select, placeholder, simulated, simulatedLabel) => {
+      select.replaceChildren();
+      const addOption = (value, text) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        select.append(option);
+      };
+      addOption("", placeholder);
+      for (const port of listing.ports) {
+        addOption(port.device, port.description.includes(port.device) ? port.description : `${port.device}: ${port.description}`);
+      }
+      addOption(simulated, simulatedLabel);
     };
-    select.replaceChildren();
-    addOption("", "Choose a portâ€¦");
-    for (const port of ports) {
-      addOption(port.device, port.description.includes(port.device) ? port.description : `${port.device}: ${port.description}`);
-    }
-    addOption(simulatedPort, "Simulated Arduino (test data)");
+    fill(sensorSelect, "Choose a port…", listing.simulated_port, "Simulated Arduino (test data)");
+    fill(gripperSelect, "Choose a port…", listing.simulated_actuator_port, "Simulated gripper (test only)");
 
-    // never preselect the simulator, so test data can't be recorded by accident
-    const available = [...select.options].map((o) => o.value);
-    const likely = ports.find((p) => p.likely_arduino);
-    if (previous && previous !== simulatedPort && available.includes(previous)) select.value = previous;
-    else if (likely) select.value = likely.device;
-    else select.value = "";
+    // never preselect a simulator, so test data can't be recorded by accident
+    const restore = (select, previous, simulated) => {
+      const available = [...select.options].map((o) => o.value);
+      select.value = previous && previous !== simulated && available.includes(previous) ? previous : "";
+    };
+    restore(sensorSelect, previousSensor, listing.simulated_port);
+    restore(gripperSelect, previousGripper, listing.simulated_actuator_port);
+    const likely = listing.ports.find((p) => p.likely_arduino);
+    if (!sensorSelect.value && likely) sensorSelect.value = likely.device;
   } catch (error) {
     state.localError = "Couldn't list serial ports.";
     renderBanner();
+    return;
+  }
+  await findArduinos(likelyOnly);
+}
+
+// COM numbers change between computers, so ask each port which Arduino it is.
+async function findArduinos(likelyOnly) {
+  const note = $("detectStatus");
+  note.textContent = "Looking for your Arduinos…";
+  try {
+    const response = await fetch("/api/ports/identify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ likely_only: likelyOnly }),
+    });
+    if (!response.ok) {
+      note.textContent = "";
+      return;
+    }
+    const found = await response.json();
+    if (found.sensors && !$("portSelect").disabled) $("portSelect").value = found.sensors;
+    if (found.actuator && !$("gripperPort").disabled) $("gripperPort").value = found.actuator;
+
+    const parts = [];
+    if (found.sensors) parts.push(`Sensors on ${found.sensors}.`);
+    if (found.actuator) parts.push(`Gripper on ${found.actuator}.`);
+    if (found.sensors && !found.actuator) parts.push("The gripper Arduino didn't answer. It may need the latest actuator_control.ino.");
+    if (found.busy.length) parts.push(`${found.busy.join(", ")} in use by another program.`);
+    if (parts.length === 0) parts.push("No Arduinos found. Check that they're plugged in.");
+    note.textContent = parts.join(" ");
+  } catch (error) {
+    note.textContent = "";
   }
 }
 
-function loadSavedPort() {
+function loadSavedPort(key) {
   try {
-    return localStorage.getItem("flexiforce-port");
+    return localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-function savePort(port) {
+function savePort(key, port) {
   try {
-    localStorage.setItem("flexiforce-port", port);
+    localStorage.setItem(key, port);
   } catch {
     // only a convenience, so it's fine if storage is blocked
   }
@@ -1014,15 +1059,18 @@ async function refreshRecordings() {
       const actions = document.createElement("td");
       const wrap = document.createElement("div");
       wrap.className = "row-actions";
-      const replay = document.createElement("button");
-      replay.type = "button";
-      replay.textContent = "Replay";
-      replay.addEventListener("click", () => startReplay(recording.name));
+      if (recording.replayable) {
+        const replay = document.createElement("button");
+        replay.type = "button";
+        replay.textContent = "Replay";
+        replay.addEventListener("click", () => startReplay(recording.name));
+        wrap.append(replay);
+      }
       const download = document.createElement("a");
       download.className = "button-link";
       download.href = `/api/recordings/${encodeURIComponent(recording.name)}?download=1`;
       download.textContent = "Download";
-      wrap.append(replay, download);
+      wrap.append(download);
       actions.append(wrap);
       row.append(actions);
       body.append(row);
@@ -1181,8 +1229,9 @@ function applyRangeInputs() {
 }
 
 function bindControls() {
-  $("refreshPorts").addEventListener("click", refreshPorts);
-  $("portSelect").addEventListener("change", (event) => savePort(event.target.value));
+  $("findArduinos").addEventListener("click", () => refreshPorts());
+  $("portSelect").addEventListener("change", (event) => savePort("flexiforce-port", event.target.value));
+  $("gripperPort").addEventListener("change", (event) => savePort("flexiforce-gripper-port", event.target.value));
   $("refreshRecordings").addEventListener("click", refreshRecordings);
 
   $("recordButton").addEventListener("click", async () => {
@@ -1265,6 +1314,21 @@ function bindControls() {
   $("replayExit").addEventListener("click", exitReplay);
 }
 
+const gripper = initGripper({
+  post,
+  sensorPort: () => $("portSelect").value,
+  runLabel: () => $("runLabel").value,
+  sensorName: (column) => {
+    const channel = Number(column.match(/\d+/)[0]);
+    const sensor = sensors.find((s) => s.channel === channel);
+    return sensor ? `S${channel} (${sensor.location})` : `S${channel}`;
+  },
+  beforeTestStart: () => {
+    if (state.replay) exitReplay();
+  },
+  onResult: refreshRecordings,
+});
+
 // ------------------------------- main loop --------------------------------
 
 let lastDraw = 0;
@@ -1320,7 +1384,7 @@ function init() {
   new ResizeObserver(fitCanvases).observe($("modelCanvas").parentElement);
   new ResizeObserver(fitCanvases).observe(chart.canvas.parentElement);
 
-  refreshPorts();
+  refreshPorts({ likelyOnly: true });
   refreshRecordings();
   connectStream();
   requestAnimationFrame(frame);

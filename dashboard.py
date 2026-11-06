@@ -3,7 +3,9 @@ dashboard.py
 -------------
 Local web dashboard for the Arduino Mega FlexiForce logger. Shows the 10
 sensors live on a 3D cylinder and a flat heat grid, records runs to CSV,
-and replays saved runs. The page itself lives in the dashboard/ folder.
+and replays saved runs. With the actuator Arduino plugged in too, it can
+also run automated gripper tests (see gripper_test.py). The page itself
+lives in the dashboard/ folder.
 
 Recordings use the same columns as collect_data.py plus a "marker"
 column, so plot_data.py works on them too. They hold raw voltages only.
@@ -40,7 +42,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import serial
 from serial.tools import list_ports
 
-BAUD = 115200
+from gripper_test import (COMMON_USB_SERIAL_VIDS, SENSOR_BAUD, SIMULATED_ACTUATOR_PORT, ActuatorLink, GripperTest,
+                          friendly_open_error, identify_arduinos, simulated_gripper)
+
 SIMULATED_PORT = "SIMULATED"
 RESET_WAIT_S = 2.0        # the Mega resets when the port opens
 NO_DATA_TIMEOUT_S = 5.0
@@ -54,6 +58,7 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/config.js": ("config.js", "text/javascript; charset=utf-8"),
     "/model3d.js": ("model3d.js", "text/javascript; charset=utf-8"),
+    "/gripper.js": ("gripper.js", "text/javascript; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
 
@@ -109,26 +114,18 @@ class SimulatedArduino:
         if self.count % 997 == 0:
             return b"12,0.4\r\n"  # a torn line, like the real port occasionally produces
 
-        # a slow squeeze whose contact point drifts along the arc of each side
-        squeeze = math.sin(math.pi * t / 8.0) ** 2
+        # with the simulated gripper connected the load follows it, and otherwise
+        # it's a slow squeeze whose contact point drifts along the arc of each side
+        gripped = simulated_gripper.active
+        squeeze = simulated_gripper.closure() if gripped else math.sin(math.pi * t / 8.0) ** 2
         values = []
         for side_gain, drift in ((1.0, 0.4), (0.85, -0.3)):
-            center = drift * math.sin(t / 5.0)
+            center = drift if gripped else drift * math.sin(t / 5.0)
             for arc in self.ARC_POSITIONS_IN:
                 load = side_gain * squeeze * math.exp(-((arc - center) / 0.6) ** 2)
                 values.append(min(5.0, 0.436 + 4.8 * load + random.gauss(0, 0.003)))
         fields = [str(round(t * 1000))] + [f"{v:.4f}" for v in values]
         return (",".join(fields) + "\r\n").encode()
-
-
-def friendly_open_error(port, error):
-    text = str(error)
-    if "PermissionError" in text or "Access is denied" in text:
-        return (f"{port} is in use by another program. Close the Arduino IDE's Serial Monitor/Plotter "
-                "and any running collect_data.py or live_view.py, then try again.")
-    if "FileNotFoundError" in text or "could not find" in text.lower():
-        return f"{port} wasn't found. Check the USB cable and refresh the port list."
-    return f"Couldn't open {port}: {text}"
 
 
 def list_serial_ports():
@@ -139,7 +136,7 @@ def list_serial_ports():
         ports.append({
             "device": p.device,
             "description": description,
-            "likely_arduino": p.vid == 0x2341 or any(k in lowered for k in ("arduino", "ch340", "mega")),
+            "likely_arduino": p.vid in COMMON_USB_SERIAL_VIDS or any(k in lowered for k in ("arduino", "ch340", "mega")),
             "bluetooth": "bluetooth" in lowered,
         })
     ports.sort(key=lambda p: (not p["likely_arduino"], p["bluetooth"], p["device"]))
@@ -157,6 +154,8 @@ class Client:
 class Acquisition:
     """Owns the serial connection, parses the stream, and writes recordings."""
 
+    simulated_port = SIMULATED_PORT
+
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.lock = threading.RLock()
@@ -168,7 +167,7 @@ class Acquisition:
         self.error = None
         self.recording = None
         self.last_saved = None
-        self.pending_marker = None
+        self.pending_markers = []
         self.marker_count = 0
         self._reset_counters()
 
@@ -240,12 +239,14 @@ class Acquisition:
                     "elapsed_s": (rec["last_t"] - rec["t0"]) / 1000.0,
                 }
 
-    def add_marker(self):
+    def add_marker(self, label=None):
         with self.lock:
             if self.state != "live":
                 raise ValueError("Markers need a live connection.")
-            self.marker_count += 1
-            self.pending_marker = f"Mark {self.marker_count}"
+            if label is None:
+                self.marker_count += 1
+                label = f"Mark {self.marker_count}"
+            self.pending_markers.append(label)
 
     def add_client(self):
         client = Client()
@@ -299,6 +300,7 @@ class Acquisition:
                 "modified": info.st_mtime,
                 "duration_s": last_time_s(entry.path),
                 "active": entry.name == active,
+                "replayable": not entry.name.endswith("_summary.csv"),
             })
         recordings.sort(key=lambda r: r["modified"], reverse=True)
         return recordings
@@ -306,7 +308,7 @@ class Acquisition:
     def _run(self, port, stop):
         ser = None
         try:
-            ser = SimulatedArduino() if port == SIMULATED_PORT else serial.Serial(port, BAUD, timeout=0.2)
+            ser = SimulatedArduino() if port == SIMULATED_PORT else serial.Serial(port, SENSOR_BAUD, timeout=0.2)
             if port != SIMULATED_PORT:
                 stop.wait(RESET_WAIT_S)
             ser.reset_input_buffer()
@@ -329,7 +331,7 @@ class Acquisition:
             self.stop_recording()
             with self.lock:
                 self.state = "idle"
-                self.pending_marker = None
+                self.pending_markers = []
 
     def _set_error(self, message):
         with self.lock:
@@ -386,8 +388,8 @@ class Acquisition:
                 self.intervals.append(interval)
             self.last_time_ms = time_ms
 
-            marker = self.pending_marker
-            self.pending_marker = None
+            marker = "; ".join(self.pending_markers)
+            self.pending_markers = []
             if self.recording is not None:
                 self._write_row(header, fields, time_ms, marker)
 
@@ -433,7 +435,16 @@ def last_time_s(path):
 
 
 class Handler(BaseHTTPRequestHandler):
-    acquisition = None  # set in main()
+    # set in main()
+    acquisition = None
+    actuator = None
+    gripper_test = None
+
+    def _full_status(self):
+        status = self.acquisition.status()
+        status["actuator"] = self.actuator.status()
+        status["test"] = self.gripper_test.status()
+        return status
 
     def log_message(self, format, *args):
         pass  # the 20 Hz stream would bury anything useful in the terminal
@@ -461,9 +472,12 @@ class Handler(BaseHTTPRequestHandler):
         if url.path in STATIC_FILES:
             self._send_static(*STATIC_FILES[url.path])
         elif url.path == "/api/ports":
-            self._json({"ports": list_serial_ports(), "simulated_port": SIMULATED_PORT})
+            self._json({"ports": list_serial_ports(), "simulated_port": SIMULATED_PORT,
+                        "simulated_actuator_port": SIMULATED_ACTUATOR_PORT})
         elif url.path == "/api/status":
-            self._json(self.acquisition.status())
+            self._json(self._full_status())
+        elif url.path == "/api/test/result":
+            self._json(self.gripper_test.result or {})
         elif url.path == "/api/recordings":
             self._json({"recordings": self.acquisition.list_recordings(),
                         "data_dir": self.acquisition.data_dir})
@@ -488,7 +502,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         acq = self.acquisition
+        test = self.gripper_test
+        link = self.actuator
         try:
+            if test.running and self.path in BLOCKED_DURING_TEST:
+                raise ValueError("A gripper test is running. Stop the test first.")
+
             if self.path == "/api/connect":
                 if not body.get("port"):
                     raise ValueError("Choose a serial port first.")
@@ -501,13 +520,39 @@ class Handler(BaseHTTPRequestHandler):
                 acq.stop_recording()
             elif self.path == "/api/marker":
                 acq.add_marker()
+            elif self.path == "/api/ports/identify":
+                self._json(self._identify(bool(body.get("likely_only"))))
+                return
+            elif self.path == "/api/gripper/connect":
+                link.connect(body.get("port"))
+            elif self.path == "/api/gripper/disconnect":
+                link.disconnect()
+            elif self.path == "/api/gripper/move":
+                position = body.get("position")
+                if position not in ("open", "closed"):
+                    raise ValueError("Unknown gripper position.")
+                link.move(position)
+                if acq.state == "live":
+                    acq.add_marker(f"Gripper {position} (website)")
+            elif self.path == "/api/test/start":
+                test.start(body.get("port"), body.get("actuator_port"), body.get("label"), *parse_test_settings(body))
+            elif self.path == "/api/test/stop":
+                test.stop()
             else:
                 self.send_error(404)
                 return
         except ValueError as e:
             self._json({"error": str(e)}, 409)
             return
-        self._json(acq.status())
+        self._json(self._full_status())
+
+    def _identify(self, likely_only):
+        in_use = {}
+        if self.acquisition.state != "idle" and self.acquisition.port != SIMULATED_PORT:
+            in_use[self.acquisition.port] = "sensors"
+        if self.actuator.state == "connected" and self.actuator.port != SIMULATED_ACTUATOR_PORT:
+            in_use[self.actuator.port] = "actuator"
+        return identify_arduinos(in_use, likely_only)
 
     def _send_static(self, filename, content_type):
         with open(os.path.join(STATIC_DIR, filename), "rb") as f:
@@ -551,7 +596,7 @@ class Handler(BaseHTTPRequestHandler):
                     markers = list(client.markers)
                     client.samples.clear()
                     client.markers.clear()
-                message = {"samples": samples, "markers": markers, "status": acq.status()}
+                message = {"samples": samples, "markers": markers, "status": self._full_status()}
                 self.wfile.write(b"data: " + json.dumps(message).encode() + b"\n\n")
                 self.wfile.flush()
                 time.sleep(0.05)
@@ -559,6 +604,34 @@ class Handler(BaseHTTPRequestHandler):
             pass  # the browser tab closed
         finally:
             acq.remove_client(client)
+
+
+BLOCKED_DURING_TEST = {
+    "/api/disconnect", "/api/record/start", "/api/record/stop", "/api/ports/identify",
+    "/api/gripper/connect", "/api/gripper/disconnect", "/api/gripper/move",
+}
+
+
+def parse_number(body, key, label, low, high):
+    try:
+        value = float(body.get(key))
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a number.")
+    if not low <= value <= high:
+        raise ValueError(f"{label} must be between {low:g} and {high:g}.")
+    return value
+
+
+def parse_test_settings(body):
+    cycles = parse_number(body, "cycles", "Trials", 1, 50)
+    if cycles != int(cycles):
+        raise ValueError("Trials must be a whole number.")
+    closed_s = parse_number(body, "closed_s", "Closed time", 2, 600)
+    open_s = parse_number(body, "open_s", "Open time", 2, 600)
+    settle_s = parse_number(body, "settle_s", "Ignored time", 0, 600)
+    if settle_s >= min(closed_s, open_s):
+        raise ValueError("The ignored time must be shorter than the closed and open times.")
+    return int(cycles), closed_s, open_s, settle_s
 
 
 def parse_duration(value):
@@ -587,7 +660,20 @@ def main():
     data_dir = os.path.abspath(args.data_dir)
     os.makedirs(data_dir, exist_ok=True)
 
-    Handler.acquisition = Acquisition(data_dir)
+    acquisition = Acquisition(data_dir)
+
+    def on_gripper_button(position):
+        # manual runs get the button presses marked too, whenever the actuator is connected
+        try:
+            acquisition.add_marker(f"Gripper {position} (button)")
+        except ValueError:
+            pass  # nothing is streaming, so there's nothing to mark
+
+    actuator = ActuatorLink(on_gripper_button)
+    gripper_test = GripperTest(acquisition, actuator, data_dir)
+    Handler.acquisition = acquisition
+    Handler.actuator = actuator
+    Handler.gripper_test = gripper_test
     ThreadingHTTPServer.daemon_threads = True
     try:
         # 127.0.0.1 only, so nothing else on the network can reach it
@@ -609,7 +695,10 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
-        Handler.acquisition.disconnect()
+        gripper_test.stop()  # this also opens the gripper if a test was running
+        gripper_test.join(timeout=5)
+        acquisition.disconnect()
+        actuator.disconnect()
         server.server_close()
 
 

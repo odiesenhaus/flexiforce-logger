@@ -169,7 +169,16 @@ input[type="number"] { width: 92px; }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
 .model-card { grid-column: span 8; }
 .heat-card { grid-column: span 4; }
-.chart-card, .table-card, .recordings-card { grid-column: span 12; }
+.chart-card, .table-card, .results-card, .recordings-card { grid-column: span 12; }
+
+.test-head { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.test-panel input[type="number"] { width: 84px; }
+.pill[data-state="connected"] .dot { background: var(--good); }
+.test-progress { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.test-progress progress { flex: 0 1 220px; height: 10px; accent-color: var(--accent); }
+.result-files { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; }
+.result-files a { color: var(--ink); overflow-wrap: anywhere; }
+#resultsNote { overflow-wrap: anywhere; }
 
 .segmented { display: flex; gap: 4px; }
 .segmented button { min-height: 30px; padding: 2px 10px; font-size: 13px; }

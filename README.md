@@ -19,6 +19,7 @@ An Arduino Mega 2560 samples ten Tekscan FlexiForce sensors at 100 Hz and stream
 | `plot_data.py` | Quick-look voltage-vs-time plots of a saved CSV, as stacked subplots or overlaid on one axis. |
 | `live_view.py` | Real-time scrolling graph straight from the serial port, with each channel's mean and standard deviation over the visible window. Saves nothing to disk. |
 | `dashboard.py`, `dashboard/` | Local web dashboard: live 3D cylinder and heat grid, one-click recording, and replay of saved runs. |
+| `gripper_test.py` | Runs automated gripper tests for the dashboard, then splits each recording into trials and computes statistics. |
 
 ## Setup
 
@@ -88,6 +89,29 @@ This opens http://localhost:8765 and only needs pyserial, so it works without in
 - **Replay:** plays any saved run through the same views, including older `collect_data.py` files.
 
 The sensor layout, channel order, color range, and the spot for force calibration are all in `dashboard/config.js`.
+
+## Automated gripper test
+
+With the actuator Arduino plugged in as well, **Start test** runs the gripper through a set number of trials while recording. It defaults to 4 trials of 10 s closed and 10 s open, after 5 s to open the gripper and get ready. The actuator Arduino needs `actuator_control/actuator_control.ino`, which accepts `o` (open), `c` (close), and `?` (identify) over serial at 9600 baud. Its physical button still works, and the open and closed positions are still set only in that sketch.
+
+Each test saves three files:
+
+| File | Contents |
+| --- | --- |
+| `flexiforce_<time>_<name>.csv` | The full recording, with every event in the `marker` column |
+| `flexiforce_<time>_<name>_trials.csv` | Only the complete trials, labeled by `trial`, `phase` (closed or open), and `trial_time_s` |
+| `flexiforce_<time>_<name>_summary.csv` | Mean, standard deviation, min, max, and % saturated for each phase, sensor, and trial |
+
+- **Timing:** each phase is timed from the moment its command is sent, so the closed time includes the time spent moving.
+- **Statistics:** the first few seconds of each phase (**Ignore first**, default 4 s) are left out of the statistics because the gripper is still moving. Those rows stay in the trials file with `in_stats` set to 0.
+- **The `all` rows in the summary:** the mean is the average of the trial means, and the standard deviation is between those trial means.
+- **Stopping early:** pressing **Stop test**, pressing the physical button, or losing either connection ends the test and opens the gripper. Trials that finished are still analyzed.
+
+Pressing the physical button during a normal recording is marked in the file automatically if the actuator Arduino is connected. Recording works the same as before if it isn't.
+
+### Serial ports
+
+COM numbers differ between computers and can change when a board moves to another USB socket, so nothing in the code depends on them. **Find Arduinos** asks each USB serial port which board it is and fills in both dropdowns, and it also runs when the page loads. Each port can only be used by one program at a time, so close the Arduino IDE's Serial Monitor before connecting, and press **Disconnect** before uploading a sketch.
 
 ## Notes
 
