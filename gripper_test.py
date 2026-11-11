@@ -33,7 +33,10 @@ HANDSHAKE_TIMEOUT_S = 3.5
 PREPARE_S = 5.0   # lets the gripper finish opening before the first trial
 START_TIMEOUT_S = 10.0
 
-COMMON_USB_SERIAL_VIDS = {0x2341, 0x2A03, 0x1A86, 0x10C4, 0x0403}  # Arduino, CH340, CP210x, and FTDI chips
+WRITE_TIMEOUT_S = 1.0
+ARDUINO_VIDS = {0x2341, 0x2A03}
+ATMEL_VID = 0x03EB  # the EDBG debugger chip behind the Zero and M0 Pro programming ports
+COMMON_USB_SERIAL_VIDS = ARDUINO_VIDS | {ATMEL_VID, 0x1A86, 0x10C4, 0x0403}  # plus CH340, CP210x, and FTDI chips
 
 GRIPPER_EVENT = re.compile(r"^# GRIPPER (OPEN|CLOSED) (\w+)")
 IDENTITY = re.compile(r"^# ACTUATOR CONTROLLER(?: gripper=(\w+))?")
@@ -51,13 +54,35 @@ def friendly_open_error(port, error):
     return f"Couldn't open {port}: {text}"
 
 
-def open_without_reset(port, baud, timeout):
-    """Arduinos usually reset when a port opens, and DTR off prevents that."""
+def needs_dtr(port_info):
+    """
+    Some boards only pass data once the computer turns DTR on:
+    - native USB ports (Zero, M0, Leonardo), which Arduino gives a product ID with the top bit set
+    - the EDBG programming port on the Zero and M0 Pro
+    Turning DTR on doesn't reset either of them.
+    """
+    vid = getattr(port_info, "vid", None)
+    pid = getattr(port_info, "pid", None)
+    native = vid in ARDUINO_VIDS and pid is not None and pid & 0x8000 != 0
+    return native or vid == ATMEL_VID
+
+
+def port_info(port):
+    for p in list_ports.comports():
+        if p.device == port:
+            return p
+    return None
+
+
+def open_without_reset(port, baud, timeout, dtr=False):
+    """Arduinos with a separate USB chip, like the Uno, reset when DTR turns on, so it stays off for those."""
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = baud
     ser.timeout = timeout
-    ser.dtr = False
+    # without this, a board that stops reading can block a write forever and keep the port locked
+    ser.write_timeout = WRITE_TIMEOUT_S
+    ser.dtr = dtr
     ser.rts = False
     ser.open()
     return ser
@@ -155,11 +180,14 @@ class ActuatorLink:
             if port == SIMULATED_ACTUATOR_PORT:
                 ser = SimulatedActuator()
             else:
-                ser = open_without_reset(port, ACTUATOR_BAUD, 0.1)
+                ser = open_without_reset(port, ACTUATOR_BAUD, 0.1, needs_dtr(port_info(port)))
         except (serial.SerialException, OSError) as e:
             raise ValueError(friendly_open_error(port, e))
 
-        gripper = self._handshake(ser)
+        try:
+            gripper = self._handshake(ser)
+        except (serial.SerialException, OSError):
+            gripper = None  # a write timed out because the board isn't reading this port
         if gripper is None:
             ser.close()
             raise ValueError(f"{port} didn't answer as the gripper Arduino. Check that it has the latest "
@@ -238,10 +266,10 @@ class ActuatorLink:
             raise ValueError("The gripper Arduino didn't confirm the move.")
 
 
-def probe_port(device):
+def probe_port(device, dtr=False):
     """Works out which Arduino is on a port. Returns 'sensors', 'actuator', 'busy', or None."""
     try:
-        ser = open_without_reset(device, ACTUATOR_BAUD, 0.05)
+        ser = open_without_reset(device, ACTUATOR_BAUD, 0.05, dtr)
     except (serial.SerialException, OSError):
         return "busy"
 
@@ -286,15 +314,15 @@ def identify_arduinos(in_use=None, likely_only=False):
     roles = dict(in_use)
     threads = []
 
-    def work(device):
-        roles[device] = probe_port(device)
+    def work(device, dtr):
+        roles[device] = probe_port(device, dtr)
 
     for p in list_ports.comports():
         if p.vid is None or p.device in in_use:
             continue  # no vendor ID means it isn't USB, like the Bluetooth ports
         if likely_only and p.vid not in COMMON_USB_SERIAL_VIDS:
             continue
-        thread = threading.Thread(target=work, args=(p.device,), daemon=True)
+        thread = threading.Thread(target=work, args=(p.device, needs_dtr(p)), daemon=True)
         thread.start()
         threads.append(thread)
     for thread in threads:
@@ -350,13 +378,18 @@ def phase_of(trial, t):
     return None, None
 
 
-def summarize(values):
+UNITS = ("V", "N", "MPa")
+DECIMALS = {"V": 4, "N": 4, "MPa": 5}
+
+
+def summarize(values, saturation_check):
     return {
         "mean": statistics.fmean(values),
         "std": statistics.stdev(values) if len(values) > 1 else 0.0,
         "min": min(values),
         "max": max(values),
-        "saturated_pct": 100.0 * sum(v >= SATURATION_V for v in values) / len(values),
+        # only the volts can show saturation; N and MPa rows borrow it from them
+        "saturated_pct": 100.0 * sum(v >= SATURATION_V for v in values) / len(values) if saturation_check else None,
         "samples": len(values),
     }
 
@@ -366,16 +399,21 @@ def analyze_run(raw_path, settle_s):
     Splits a marked recording into trials and works out the statistics.
     The first settle_s of each phase counts as the gripper moving, so it stays
     in the trials file but is left out of the statistics.
+
+    Recordings made with calibrated sensors also have S#_N and S#_MPa columns,
+    and those get the same statistics as the volts.
     """
     header, rows = read_run(raw_path)
     trials = split_trials(header, rows)
-    channels = [c for c in header if c.startswith("S") and c.endswith("_V")]
+    channels = [c for c in header if re.fullmatch(r"S\d+_V", c)]
+    units = [u for u in UNITS if any(f"{c[:-2]}_{u}" in header for c in channels)]
+    columns = [f"{c[:-2]}_{u}" for u in units for c in channels if f"{c[:-2]}_{u}" in header]
+    index = {c: header.index(c) for c in columns}
     time_col = header.index("time_ms")
-    columns = {c: header.index(c) for c in channels}
     settle_ms = settle_s * 1000
 
     labeled = []
-    samples = {t["number"]: {"closed": {c: [] for c in channels}, "open": {c: [] for c in channels}} for t in trials}
+    samples = {t["number"]: {"closed": {c: [] for c in columns}, "open": {c: [] for c in columns}} for t in trials}
     for row in rows:
         t = float(row[time_col])
         for trial in trials:
@@ -385,62 +423,90 @@ def analyze_run(raw_path, settle_s):
             in_stats = since_start >= settle_ms
             labeled.append((row, trial, phase, in_stats))
             if in_stats:
-                for channel in channels:
-                    samples[trial["number"]][phase][channel].append(float(row[columns[channel]]))
+                for column in columns:
+                    value = row[index[column]]
+                    if value:  # blank for a sensor that wasn't calibrated
+                        samples[trial["number"]][phase][column].append(float(value))
             break
 
     phases = {}
     for phase in ("closed", "open"):
         phases[phase] = {}
-        for channel in channels:
-            per_trial = [summarize(samples[t["number"]][phase][channel]) for t in trials
-                         if samples[t["number"]][phase][channel]]
-            if not per_trial:
+        for column in columns:
+            volts = column.endswith("_V")
+            # one entry per trial, in order, so every unit lines up with the same trial
+            per_trial = [summarize(samples[t["number"]][phase][column], volts) if samples[t["number"]][phase][column]
+                         else None for t in trials]
+            present = [s for s in per_trial if s]
+            if not present:
                 continue
-            means = [s["mean"] for s in per_trial]
-            total = sum(s["samples"] for s in per_trial)
-            phases[phase][channel] = {
+            means = [s["mean"] for s in present]
+            total = sum(s["samples"] for s in present)
+            phases[phase][column] = {
                 "trials": per_trial,
                 "mean": statistics.fmean(means),
                 # how much the trials differ from each other
                 "std": statistics.stdev(means) if len(means) > 1 else None,
-                "min": min(s["min"] for s in per_trial),
-                "max": max(s["max"] for s in per_trial),
-                "saturated_pct": sum(s["saturated_pct"] * s["samples"] for s in per_trial) / total,
+                "min": min(s["min"] for s in present),
+                "max": max(s["max"] for s in present),
+                "saturated_pct": sum(s["saturated_pct"] * s["samples"] for s in present) / total if volts else None,
                 "samples": total,
             }
 
-    return {"header": header, "trials": trials, "channels": channels, "labeled": labeled, "phases": phases}
+    return {"header": header, "trials": trials, "channels": channels, "units": units, "columns": columns,
+            "labeled": labeled, "phases": phases}
 
 
 def write_trials_csv(path, analysis):
-    channels = analysis["channels"]
     header = analysis["header"]
+    columns = analysis["columns"]
     time_col = header.index("time_ms")
-    columns = [header.index(c) for c in channels]
+    index = [header.index(c) for c in columns]
     with open(path, "x", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["time_ms", "trial", "phase", "trial_time_s", "in_stats"] + channels)
+        writer.writerow(["time_ms", "trial", "phase", "trial_time_s", "in_stats"] + columns)
         for row, trial, phase, in_stats in analysis["labeled"]:
             trial_time = (float(row[time_col]) - trial["close"]) / 1000.0
             writer.writerow([row[time_col], trial["number"], phase, f"{trial_time:.3f}", int(in_stats)]
-                            + [row[c] for c in columns])
+                            + [row[i] for i in index])
 
 
 def write_summary_csv(path, analysis):
+    units = analysis["units"]
     trial_numbers = [t["number"] for t in analysis["trials"]]
+
+    def unit_cells(stats, unit, std=None):
+        if stats is None:
+            return ["", "", "", ""]
+        d = DECIMALS[unit]
+        std = stats["std"] if std is None else std
+        return [f"{stats['mean']:.{d}f}", "" if std is None else f"{std:.{d}f}", f"{stats['min']:.{d}f}",
+                f"{stats['max']:.{d}f}"]
+
     with open(path, "x", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["phase", "sensor", "trial", "mean_V", "std_V", "min_V", "max_V", "saturated_pct", "samples"])
-        for phase, by_channel in analysis["phases"].items():
-            for channel, stats in by_channel.items():
-                for number, s in zip(trial_numbers, stats["trials"]):
-                    writer.writerow([phase, channel, number, f"{s['mean']:.4f}", f"{s['std']:.4f}", f"{s['min']:.4f}",
-                                     f"{s['max']:.4f}", f"{s['saturated_pct']:.1f}", s["samples"]])
+        writer.writerow(["phase", "sensor", "trial"]
+                        + [f"{stat}_{u}" for u in units for stat in ("mean", "std", "min", "max")]
+                        + ["saturated_pct", "samples"])
+        for phase, by_column in analysis["phases"].items():
+            for channel in analysis["channels"]:
+                sensor = channel[:-2]
+                volts = by_column.get(channel)
+                if volts is None:
+                    continue
+                for i, number in enumerate(trial_numbers):
+                    cells = []
+                    for u in units:
+                        stats = by_column.get(f"{sensor}_{u}")
+                        cells += unit_cells(stats["trials"][i] if stats else None, u)
+                    v = volts["trials"][i]
+                    writer.writerow([phase, sensor, number] + cells
+                                    + ([f"{v['saturated_pct']:.1f}", v["samples"]] if v else ["", ""]))
                 # "all" is the average of the trial means, with the std between those means
-                std = "" if stats["std"] is None else f"{stats['std']:.4f}"
-                writer.writerow([phase, channel, "all", f"{stats['mean']:.4f}", std, f"{stats['min']:.4f}",
-                                 f"{stats['max']:.4f}", f"{stats['saturated_pct']:.1f}", stats["samples"]])
+                cells = []
+                for u in units:
+                    cells += unit_cells(by_column.get(f"{sensor}_{u}"), u)
+                writer.writerow([phase, sensor, "all"] + cells + [f"{volts['saturated_pct']:.1f}", volts["samples"]])
 
 
 # ------------------------------- test runner ------------------------------
@@ -628,6 +694,7 @@ class GripperTest:
             "note": self.message,
             "saturation_v": SATURATION_V,
             "channels": analysis["channels"],
+            "units": analysis["units"],
             "phases": analysis["phases"],
             "trial_numbers": [t["number"] for t in analysis["trials"]],
         }

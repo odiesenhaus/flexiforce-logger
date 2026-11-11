@@ -91,7 +91,74 @@
     <button id="replayExit" type="button" class="ghost">Back to live</button>
   </section>
 
+  <details id="calPanel" class="controls cal-panel">
+    <summary><span class="cal-title">Sensor calibration</span> <span id="calSummary" class="muted"></span></summary>
+    <div class="cal-body">
+      <div class="cal-top">
+        <label class="field">Sensor
+          <span class="inline">
+            <select id="calSensor"></select>
+            <button id="calNext" type="button" class="ghost">Next sensor</button>
+          </span>
+        </label>
+        <div class="cal-live" aria-live="off">
+          <span id="calLiveValue" class="tile-value">–</span>
+          <span id="calLiveForce" class="muted"></span>
+          <span id="calLiveFlag" class="saturated-note"></span>
+        </div>
+      </div>
+      <p id="calSavedNote" class="muted hint"></p>
+      <ol class="cal-steps">
+        <li><strong>Condition it (recommended).</strong> Put the 500 g weight on and take it off 3–5 times, about 10 s each.</li>
+        <li><strong>Set the sensitivity.</strong> With 500 g on, turn this sensor's potentiometer until the reading just reaches the top, about 4.9–5.0 V. If you turn it again later, recalibrate.</li>
+        <li><strong>Record the weights.</strong> Start with nothing on the sensor. Place each weight the same way each time, wait about 10 s for the reading to settle, then capture it.
+          <div class="cal-capture">
+            <span id="calWeights" class="actions"></span>
+            <span class="inline">
+              <input id="calOtherWeight" type="number" min="0" step="any" placeholder="Other" aria-label="Other weight in grams">
+              <span class="muted">g</span>
+              <button id="calCaptureOther" type="button">Capture</button>
+            </span>
+            <label class="inline muted">Average over
+              <input id="calSeconds" type="number" min="1" max="30" step="1" value="3"> s
+            </label>
+          </div>
+          <p id="calCaptureStatus" class="rec-status" aria-live="polite"></p>
+        </li>
+        <li><strong>Save and check.</strong> Save the fit, put the weights back on, and check that the reading above is roughly right. Then go to the next sensor.</li>
+      </ol>
+      <div id="calPointsTable" class="table-scroll" hidden>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col" class="num">Weight</th>
+              <th scope="col" class="num">Reading (V)</th>
+              <th scope="col" class="num">Noise (V)</th>
+              <th scope="col" class="num">Fit gives</th>
+              <th scope="col" class="num">Error</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="calPoints"></tbody>
+        </table>
+      </div>
+      <p id="calFit" class="cal-fit"></p>
+      <div class="actions">
+        <button id="calSave" type="button" class="primary" disabled>Save calibration</button>
+        <button id="calClear" type="button" class="ghost" hidden>Remove saved calibration</button>
+      </div>
+    </div>
+  </details>
+
   <section class="filters" aria-label="Display options">
+    <label class="inline">Show
+      <select id="unitSelect">
+        <option value="V">Volts</option>
+        <option value="force" data-label="Grams">Grams</option>
+        <option value="N" data-label="Newtons (N)">Newtons (N)</option>
+        <option value="MPa" data-label="Pressure (MPa)">Pressure (MPa)</option>
+      </select>
+    </label>
     <label class="inline">Time window
       <select id="windowSelect">
         <option value="5">5 s</option>
@@ -150,6 +217,7 @@
       <div class="card-head"><h2>Heat grid</h2></div>
       <div id="heatGrid" class="heat-grid"></div>
       <div class="scale-slot"></div>
+      <p id="unitNote" class="muted hint" hidden></p>
     </section>
 
     <section class="card chart-card">
@@ -188,6 +256,13 @@
           <select id="resultsPhase">
             <option value="closed">Closed</option>
             <option value="open">Open</option>
+          </select>
+        </label>
+        <label class="inline">Units
+          <select id="resultsUnit">
+            <option value="N">Newtons (N)</option>
+            <option value="MPa">Pressure (MPa)</option>
+            <option value="V">Volts</option>
           </select>
         </label>
       </div>

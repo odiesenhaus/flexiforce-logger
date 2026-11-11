@@ -6,6 +6,16 @@
 //   '?' -> report which Arduino this is and the gripper state
 // The physical button keeps working either way.
 
+// Boards with native USB, like the M0 Pro or Zero, have two USB ports: the native
+// port is SerialUSB and the programming port is Serial. Listening and replying on
+// both means either cable works. An Uno only has Serial.
+#ifdef SERIAL_PORT_USBVIRTUAL
+Stream *const PORTS[] = { &Serial, &SERIAL_PORT_USBVIRTUAL };
+#else
+Stream *const PORTS[] = { &Serial };
+#endif
+const int PORT_COUNT = sizeof(PORTS) / sizeof(PORTS[0]);
+
 //Objects
 Servo linearActuator;
 const float STROKE_LENGTH_IN = 2.0; // Linear actuator stroke length
@@ -17,14 +27,25 @@ bool isOpen = false; // Track gripper state
 bool hasMoved = false; // The position is unknown until the first move
 
 
+void sendLine(const __FlashStringHelper *first, const __FlashStringHelper *second) {
+  for (int i = 0; i < PORT_COUNT; i++) {
+    if (i > 0 && PORTS[i] == PORTS[0]) continue; // on a Leonardo both names are the same port
+    PORTS[i]->print(first);
+    PORTS[i]->println(second);
+  }
+}
+
 void setup() {
 
   // The actuator isn't attached until the first move. Attaching sends a mid-stroke
-  // pulse by default, and this board resets whenever a computer opens its serial
+  // pulse by default, and many boards reset whenever a computer opens their serial
   // port, so attaching here could move the gripper just from connecting.
   pinMode(BUTTON_PIN, INPUT_PULLUP); // Internal pull-up, no resistor needed
   Serial.begin(9600);
-  Serial.println(F("# ACTUATOR CONTROLLER READY"));
+#ifdef SERIAL_PORT_USBVIRTUAL
+  SERIAL_PORT_USBVIRTUAL.begin(9600);
+#endif
+  sendLine(F("# ACTUATOR CONTROLLER "), F("READY"));
 
 }
 
@@ -46,28 +67,28 @@ void setGripper(bool open, const __FlashStringHelper *source) {
   hasMoved = true;
 
   if (isOpen) {
-    Serial.print(F("# GRIPPER OPEN "));
     setPosition(OPEN_POSITION_IN);
+    sendLine(F("# GRIPPER OPEN "), source);
   } else {
-    Serial.print(F("# GRIPPER CLOSED "));
     setPosition(CLOSED_POSITION_IN);
+    sendLine(F("# GRIPPER CLOSED "), source);
   }
-  Serial.println(source);
 }
 
 void handleSerialCommands() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == 'o') {
-      setGripper(true, F("command"));
-    } else if (c == 'c') {
-      setGripper(false, F("command"));
-    } else if (c == '?') {
-      Serial.print(F("# ACTUATOR CONTROLLER gripper="));
-      if (!hasMoved) {
-        Serial.println(F("unknown"));
-      } else {
-        Serial.println(isOpen ? F("open") : F("closed"));
+  for (int i = 0; i < PORT_COUNT; i++) {
+    while (PORTS[i]->available() > 0) {
+      char c = PORTS[i]->read();
+      if (c == 'o') {
+        setGripper(true, F("command"));
+      } else if (c == 'c') {
+        setGripper(false, F("command"));
+      } else if (c == '?') {
+        if (!hasMoved) {
+          sendLine(F("# ACTUATOR CONTROLLER gripper="), F("unknown"));
+        } else {
+          sendLine(F("# ACTUATOR CONTROLLER gripper="), isOpen ? F("open") : F("closed"));
+        }
       }
     }
   }

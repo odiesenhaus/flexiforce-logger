@@ -4,8 +4,9 @@ dashboard.py
 Local web dashboard for the Arduino Mega FlexiForce logger. Shows the 10
 sensors live on a 3D cylinder and a flat heat grid, records runs to CSV,
 and replays saved runs. With the actuator Arduino plugged in too, it can
-also run automated gripper tests (see gripper_test.py). The page itself
-lives in the dashboard/ folder.
+also run automated gripper tests (see gripper_test.py), and each sensor can
+be calibrated to grams (see calibration.py). The page itself lives in the
+dashboard/ folder.
 
 Recordings use the same columns as collect_data.py plus a "marker"
 column, so plot_data.py works on them too. They hold raw voltages only.
@@ -42,6 +43,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import serial
 from serial.tools import list_ports
 
+from calibration import CalibrationStore, fit as calibration_fit
 from gripper_test import (COMMON_USB_SERIAL_VIDS, SENSOR_BAUD, SIMULATED_ACTUATOR_PORT, ActuatorLink, GripperTest,
                           friendly_open_error, identify_arduinos, simulated_gripper)
 
@@ -59,6 +61,7 @@ STATIC_FILES = {
     "/config.js": ("config.js", "text/javascript; charset=utf-8"),
     "/model3d.js": ("model3d.js", "text/javascript; charset=utf-8"),
     "/gripper.js": ("gripper.js", "text/javascript; charset=utf-8"),
+    "/calibration.js": ("calibration.js", "text/javascript; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
 
@@ -169,6 +172,7 @@ class Acquisition:
         self.last_saved = None
         self.pending_markers = []
         self.marker_count = 0
+        self.calibration = None  # set in main(); adds newton and MPa columns to recordings
         self._reset_counters()
 
     def _reset_counters(self):
@@ -221,6 +225,8 @@ class Acquisition:
                 "t0": None,
                 "last_t": 0,
                 "duration_s": duration_s,
+                # frozen at the start, so recalibrating mid-recording can't change the file partway
+                "conversion": self.calibration.conversion() if self.calibration else None,
             }
             self.last_saved = None
             self.connect(target)
@@ -391,24 +397,27 @@ class Acquisition:
             marker = "; ".join(self.pending_markers)
             self.pending_markers = []
             if self.recording is not None:
-                self._write_row(header, fields, time_ms, marker)
+                self._write_row(header, fields, values, time_ms, marker)
 
             for client in self.clients:
                 client.samples.append(values)
                 if marker:
                     client.markers.append({"t": time_ms, "label": marker})
 
-    def _write_row(self, header, fields, time_ms, marker):
+    def _write_row(self, header, fields, values, time_ms, marker):
         rec = self.recording
         try:
             if rec["file"] is None:
-                rec["file"] = open(os.path.join(self.data_dir, rec["name"]), "x", newline="")
-                rec["writer"] = csv.writer(rec["file"])
-                rec["writer"].writerow(header + ["marker"])
+                self._open_recording(rec, header)
                 rec["t0"] = time_ms
 
+            converted = []
+            if rec["sensor_columns"]:
+                volts = [values[i] for i in rec["sensor_columns"]]
+                converted = rec["conversion"].values(rec["channels"], volts)
+
             # each recording starts at t=0, even if the live view was already running
-            rec["writer"].writerow([round(time_ms - rec["t0"])] + fields[1:] + [marker or ""])
+            rec["writer"].writerow([round(time_ms - rec["t0"])] + fields[1:] + converted + [marker or ""])
             rec["rows"] += 1
             rec["last_t"] = time_ms
             if rec["rows"] % FLUSH_EVERY_ROWS == 0:
@@ -420,6 +429,30 @@ class Acquisition:
 
         if rec["duration_s"] is not None and (time_ms - rec["t0"]) >= rec["duration_s"] * 1000:
             self.stop_recording()
+
+    def _open_recording(self, rec, header):
+        """Volts come first, as recorded, then newtons and MPa for any calibrated sensors."""
+        rec["channels"], rec["sensor_columns"] = [], []
+        for i, name in enumerate(header):
+            match = re.fullmatch(r"S(\d+)_V", name)
+            if match:
+                rec["channels"].append(int(match.group(1)))
+                rec["sensor_columns"].append(i)
+
+        conversion = rec["conversion"]
+        if conversion is None or not conversion.lines:
+            rec["sensor_columns"] = []  # nothing calibrated, so the file is volts only
+        extra = conversion.columns(rec["channels"]) if rec["sensor_columns"] else []
+
+        rec["file"] = open(os.path.join(self.data_dir, rec["name"]), "x", newline="")
+        rec["writer"] = csv.writer(rec["file"])
+        rec["writer"].writerow(header + extra + ["marker"])
+
+        if extra:
+            # a record of exactly which calibration produced the N and MPa columns
+            sidecar = os.path.join(self.data_dir, rec["name"][:-len(".csv")] + "_calibration.json")
+            with open(sidecar, "w", encoding="utf-8") as f:
+                json.dump(conversion.describe(), f, indent=2)
 
 
 def last_time_s(path):
@@ -439,6 +472,7 @@ class Handler(BaseHTTPRequestHandler):
     acquisition = None
     actuator = None
     gripper_test = None
+    calibration = None
 
     def _full_status(self):
         status = self.acquisition.status()
@@ -476,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                         "simulated_actuator_port": SIMULATED_ACTUATOR_PORT})
         elif url.path == "/api/status":
             self._json(self._full_status())
+        elif url.path == "/api/calibration":
+            self._json(self.calibration.snapshot())
         elif url.path == "/api/test/result":
             self._json(self.gripper_test.result or {})
         elif url.path == "/api/recordings":
@@ -496,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(min(length, 4096)) or b"{}")
+            body = json.loads(self.rfile.read(min(length, 65536)) or b"{}")
         except ValueError:
             self._json({"error": "Bad request."}, 400)
             return
@@ -538,11 +574,25 @@ class Handler(BaseHTTPRequestHandler):
                 test.start(body.get("port"), body.get("actuator_port"), body.get("label"), *parse_test_settings(body))
             elif self.path == "/api/test/stop":
                 test.stop()
+            elif self.path == "/api/calibration/fit":
+                self._json(calibration_fit(body.get("points")))
+                return
+            elif self.path == "/api/calibration/save":
+                self.calibration.save(body.get("channel"), body.get("points"))
+                self._json(self.calibration.snapshot())
+                return
+            elif self.path == "/api/calibration/clear":
+                self.calibration.clear(body.get("channel"))
+                self._json(self.calibration.snapshot())
+                return
             else:
                 self.send_error(404)
                 return
         except ValueError as e:
             self._json({"error": str(e)}, 409)
+            return
+        except OSError as e:
+            self._json({"error": f"Couldn't save: {e}"}, 500)
             return
         self._json(self._full_status())
 
@@ -661,6 +711,8 @@ def main():
     os.makedirs(data_dir, exist_ok=True)
 
     acquisition = Acquisition(data_dir)
+    calibration = CalibrationStore(data_dir)
+    acquisition.calibration = calibration
 
     def on_gripper_button(position):
         # manual runs get the button presses marked too, whenever the actuator is connected
@@ -674,7 +726,11 @@ def main():
     Handler.acquisition = acquisition
     Handler.actuator = actuator
     Handler.gripper_test = gripper_test
+    Handler.calibration = calibration
     ThreadingHTTPServer.daemon_threads = True
+    # On Windows this flag lets a second server quietly share the port with one
+    # that's already running, so requests could reach either. Off, it fails instead.
+    ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
     try:
         # 127.0.0.1 only, so nothing else on the network can reach it
         server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)

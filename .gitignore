@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 
-# logged test runs
+# logged test runs, and the calibration record saved with each one
 *.csv
+*_calibration.json

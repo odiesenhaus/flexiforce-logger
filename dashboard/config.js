@@ -1,5 +1,6 @@
-// Everything about the physical setup lives here, so correcting the layout or
-// adding force calibration only means editing this file.
+// Everything about the physical setup lives here, so correcting the layout
+// only means editing this file. Force calibration is done on the page and
+// saved by the server in calibration.json.
 
 // Sizes in inches. The length is only for the drawing.
 export const CYLINDER = { diameterIn: 3, lengthIn: 3.5 };
@@ -17,16 +18,20 @@ export const SIDES = [
   { name: "Side B", angleDeg: 0, channels: [6, 7, 8, 9, 10] },
 ];
 
-// Default color scale: the bottom is the unloaded op-amp output.
-export const COLOR_RANGE = { min: 0.43, max: 5 };
+// ESS102 active sensing area from the Tekscan datasheet. Pressure is shown as
+// each sensor's force spread evenly over this circle.
+export const SENSING_DIAMETER_MM = 3.8;
 
-// Readings at or above this are flagged, since the true value may be higher.
+// Default color scales. In volts the bottom is the unloaded op-amp output; the
+// others top out at the 500 g that the sensors are tuned to saturate at.
+export const COLOR_RANGE = { min: 0.43, max: 5 };
+export const FORCE_UNIT = "g";
+export const FORCE_COLOR_RANGE = { min: 0, max: 500 };
+export const NEWTON_COLOR_RANGE = { min: 0, max: 5 };
+export const PRESSURE_COLOR_RANGE = { min: 0, max: 0.45 };
+
+// Readings at or above this many volts are flagged, since the true value may be higher.
 export const SATURATION_LEVEL = 4.98;
 
-// Force calibration goes here. Every view on the page uses this unit and this
-// function, and recordings always keep the raw volts. When it's added, also
-// change COLOR_RANGE and SATURATION_LEVEL above to the new unit.
-export const UNIT = "V";
-export function toDisplayUnits(channel, volts) {
-  return volts;
-}
+// The weights offered as one-click calibration points, in grams.
+export const CALIBRATION_WEIGHTS_G = [0, 100, 200, 500];

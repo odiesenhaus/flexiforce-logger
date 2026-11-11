@@ -79,6 +79,14 @@ export function initGripper({ post, sensorPort, runLabel, sensorName, beforeTest
     const stats = result.phases[phase];
     const numbers = result.trial_numbers;
 
+    // newtons and MPa are only there when the sensors were calibrated at the time of the test
+    const units = result.units || ["V"];
+    const unitSelect = $("resultsUnit");
+    for (const option of unitSelect.options) option.disabled = !units.includes(option.value);
+    if (!units.includes(unitSelect.value)) unitSelect.value = "V";
+    const unit = unitSelect.value;
+    const digits = { V: 3, N: 3, MPa: 4 }[unit];
+
     const head = $("resultsHead");
     head.replaceChildren();
     const headRow = document.createElement("tr");
@@ -107,21 +115,28 @@ export function initGripper({ post, sensorPort, runLabel, sensorName, beforeTest
         row.append(td);
       };
       addCell(sensorName(channel));
-      const channelStats = stats[channel];
+      const channelStats = stats[`${channel.slice(0, -2)}_${unit}`];
+      const voltStats = stats[channel]; // saturation can only be seen in the volts
       if (channelStats) {
-        for (const trial of channelStats.trials) {
-          const saturated = trial.saturated_pct > 0;
+        channelStats.trials.forEach((trial, i) => {
+          if (!trial) {
+            addCell("–", true);
+            return;
+          }
+          const saturated = voltStats && voltStats.trials[i] && voltStats.trials[i].saturated_pct > 0;
           anySaturated = anySaturated || saturated;
-          addCell(`${saturated ? "⚠ " : ""}${trial.mean.toFixed(3)} ± ${trial.std.toFixed(3)}`, true);
-        }
-        addCell(channelStats.mean.toFixed(3), true);
-        addCell(channelStats.std === null ? "–" : channelStats.std.toFixed(3), true);
+          addCell(`${saturated ? "⚠ " : ""}${trial.mean.toFixed(digits)} ± ${trial.std.toFixed(digits)}`, true);
+        });
+        addCell(channelStats.mean.toFixed(digits), true);
+        addCell(channelStats.std === null ? "–" : channelStats.std.toFixed(digits), true);
+      } else {
+        for (let i = 0; i < numbers.length + 2; i++) addCell("–", true); // not calibrated at test time
       }
       body.append(row);
     }
     $("resultsSaturated").hidden = !anySaturated;
 
-    const summary = `Each cell is the mean ± standard deviation in V for that trial, leaving out the first ${result.settle_s} s of each phase while the gripper moves.`;
+    const summary = `Each cell is the mean ± standard deviation in ${unit} for that trial, leaving out the first ${result.settle_s} s of each phase while the gripper moves.`;
     $("resultsNote").textContent = result.completed
       ? summary
       : `Ended early with ${result.trials_completed} of ${result.cycles_requested} trials finished: ${result.note} ${summary}`;
@@ -140,6 +155,7 @@ export function initGripper({ post, sensorPort, runLabel, sensorName, beforeTest
   }
 
   $("resultsPhase").addEventListener("change", renderResult);
+  $("resultsUnit").addEventListener("change", renderResult);
 
   $("gripperConnect").addEventListener("click", () => {
     if (status && status.actuator.state === "connected") post("/api/gripper/disconnect");

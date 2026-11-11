@@ -1,6 +1,8 @@
 import {
-  ARC_POSITIONS_IN, COLOR_RANGE, CYLINDER, SATURATION_LEVEL, SENSOR_HEAD_DIAMETER_IN, SIDES, UNIT, toDisplayUnits,
+  ARC_POSITIONS_IN, COLOR_RANGE, CYLINDER, FORCE_COLOR_RANGE, FORCE_UNIT, NEWTON_COLOR_RANGE, PRESSURE_COLOR_RANGE,
+  SATURATION_LEVEL, SENSING_DIAMETER_MM, SENSOR_HEAD_DIAMETER_IN, SIDES,
 } from "/config.js";
+import { initCalibration } from "/calibration.js";
 import { initGripper } from "/gripper.js";
 import { CylinderView, VIEW_PRESETS } from "/model3d.js";
 
@@ -28,6 +30,39 @@ function formatArc(arc) {
 }
 
 // ------------------------------- data store -------------------------------
+
+// Readings are stored in volts, as recorded, and converted when shown. That way
+// a new calibration applies straight away, to live data and replays alike.
+const units = { mode: "V", calibration: {} };
+
+const GRAVITY = 9.80665; // m/s², to turn the calibration's grams into newtons
+const SENSING_AREA_MM2 = Math.PI * (SENSING_DIAMETER_MM / 2) ** 2;
+
+// Decimals for tables and for the larger readouts, roughly what each unit can resolve.
+const UNIT_INFO = {
+  V: { label: "V", table: 3, cell: 2 },
+  force: { label: FORCE_UNIT, table: 1, cell: 0 },
+  N: { label: "N", table: 3, cell: 2 },
+  MPa: { label: "MPa", table: 4, cell: 3 },
+};
+
+function toUnits(channel, volts, mode = units.mode) {
+  if (mode === "V") return volts;
+  const cal = units.calibration[channel];
+  if (!cal) return NaN; // NaN shows as "–"
+  const grams = (volts - cal.intercept_v) / cal.slope_v_per_g;
+  if (mode === "force") return grams;
+  const newtons = (grams / 1000) * GRAVITY;
+  return mode === "N" ? newtons : newtons / SENSING_AREA_MM2; // N/mm² is MPa
+}
+
+const unitLabel = (mode = units.mode) => UNIT_INFO[mode].label;
+const isCalibrated = (channel) => units.mode === "V" || Boolean(units.calibration[channel]);
+
+function formatValue(value, kind = "table", mode = units.mode) {
+  if (value === null || !Number.isFinite(value)) return "–";
+  return value.toFixed(UNIT_INFO[mode][kind]);
+}
 
 // Works for both the live stream and a loaded file. `end` is how far along the
 // data the view is, which lets replay share all of the drawing code with live.
@@ -63,6 +98,10 @@ class Series {
   }
 
   value(index, channel) {
+    return toUnits(channel, this.raw(index, channel));
+  }
+
+  raw(index, channel) {
     return this.values[index * COUNT + channel - 1];
   }
 
@@ -79,7 +118,7 @@ class Series {
 
 const live = new Series();
 const liveMarkers = [];
-const peak = { values: new Float32Array(COUNT), index: 0 };
+const peak = { values: new Float32Array(COUNT), raw: new Float32Array(COUNT), index: 0 };
 
 const state = {
   replay: null,
@@ -92,6 +131,13 @@ const state = {
   windowS: 10,
   colorMode: "live",
   range: { ...COLOR_RANGE },
+  // each unit keeps its own color range
+  ranges: {
+    V: { ...COLOR_RANGE },
+    force: { ...FORCE_COLOR_RANGE },
+    N: { ...NEWTON_COLOR_RANGE },
+    MPa: { ...PRESSURE_COLOR_RANGE },
+  },
   baseline: null,
   stats: [],
   lastSavedFile: null,
@@ -161,6 +207,11 @@ function currentValue(channel) {
   return series.end > 0 ? series.value(series.end - 1, channel) : null;
 }
 
+function currentRaw(channel) {
+  const series = currentSeries();
+  return series.end > 0 ? series.raw(series.end - 1, channel) : null;
+}
+
 // What the colors and summary use: optionally zeroed, while readouts stay raw.
 function zeroed(channel, value) {
   if (!state.baseline) return value;
@@ -175,7 +226,7 @@ function colorValue(channel) {
 
 function sensorRgb(channel) {
   const value = colorValue(channel);
-  if (value === null) return null;
+  if (value === null || !Number.isFinite(value)) return null; // no data, or not calibrated
   return heatRgb((value - state.range.min) / (state.range.max - state.range.min));
 }
 
@@ -184,8 +235,11 @@ function updatePeak() {
   if (series.end < peak.index) resetPeak();
   for (let i = peak.index; i < series.end; i++) {
     for (const channel of CHANNELS) {
-      const value = series.value(i, channel);
-      if (value > peak.values[channel - 1]) peak.values[channel - 1] = value;
+      const raw = series.raw(i, channel);
+      if (raw > peak.raw[channel - 1]) {
+        peak.raw[channel - 1] = raw;
+        peak.values[channel - 1] = toUnits(channel, raw); // calibrations only ever increase with volts
+      }
     }
   }
   peak.index = series.end;
@@ -193,6 +247,7 @@ function updatePeak() {
 
 function resetPeak(fromNow = false) {
   peak.values.fill(0);
+  peak.raw.fill(0);
   peak.index = fromNow ? currentSeries().end : 0;
 }
 
@@ -261,9 +316,13 @@ const hideTooltip = () => { tooltip.hidden = true; };
 function sensorTooltip(sensor, clientX, clientY) {
   const now = currentValue(sensor.channel);
   const stat = state.stats.find((s) => s.channel === sensor.channel);
-  const rows = [{ value: now === null ? "–" : `${now.toFixed(3)} ${UNIT}`, label: "now" }];
+  if (!isCalibrated(sensor.channel)) {
+    showTooltip(clientX, clientY, `S${sensor.channel} · ${sensor.location}`, [{ value: "Not calibrated", label: "" }]);
+    return;
+  }
+  const rows = [{ value: now === null ? "–" : `${formatValue(now)} ${unitLabel()}`, label: "now" }];
   if (stat) {
-    rows.push({ value: stat.mean.toFixed(3), label: "mean" }, { value: stat.std.toFixed(3), label: "std dev" });
+    rows.push({ value: formatValue(stat.mean), label: "mean" }, { value: formatValue(stat.std), label: "std dev" });
   }
   showTooltip(clientX, clientY, `S${sensor.channel} · ${sensor.location}`, rows);
 }
@@ -313,7 +372,8 @@ function syncSelection() {
     key.className = "line-key";
     key.style.setProperty("--key", tokens.series[slot]);
     const sensor = sensors.find((s) => s.channel === channel);
-    item.append(key, `S${channel} (${sensor.location})`);
+    const uncalibrated = isCalibrated(channel) ? "" : ", not calibrated";
+    item.append(key, `S${channel} (${sensor.location}${uncalibrated})`);
     legend.append(item);
   }
 }
@@ -439,9 +499,11 @@ function buildHeatGrid() {
       const value = document.createElement("span");
       value.className = "heat-value";
       value.textContent = "–";
+      const second = document.createElement("span");
+      second.className = "heat-second";
       const flag = document.createElement("span");
       flag.className = "heat-flag";
-      cell.append(name, value, flag);
+      cell.append(name, value, second, flag);
       cell.addEventListener("click", () => toggleSensor(channel));
       cell.addEventListener("pointermove", (event) => sensorTooltip(sensor, event.clientX, event.clientY));
       cell.addEventListener("pointerleave", hideTooltip);
@@ -452,7 +514,7 @@ function buildHeatGrid() {
       cell.addEventListener("blur", hideTooltip);
       grid.append(cell);
       heatCells.set(channel, cell);
-      heatText.set(channel, { value, flag });
+      heatText.set(channel, { value, second, flag });
     }
   });
 }
@@ -466,10 +528,18 @@ function updateHeatColors() {
 }
 
 function updateHeatText() {
-  for (const [channel, { value, flag }] of heatText) {
-    const shown = state.colorMode === "peak" && hasData() ? peak.values[channel - 1] : currentValue(channel);
-    value.textContent = shown === null ? "–" : shown.toFixed(2);
-    flag.textContent = shown !== null && shown >= SATURATION_LEVEL ? "⚠ Saturated" : "";
+  // newtons and pressure are shown together, since each cell is one sensor's force on a known area
+  const otherMode = { N: "MPa", MPa: "N" }[units.mode];
+  for (const [channel, { value, second, flag }] of heatText) {
+    const usePeak = state.colorMode === "peak" && hasData();
+    const shown = usePeak ? peak.values[channel - 1] : currentValue(channel);
+    const raw = usePeak ? peak.raw[channel - 1] : currentRaw(channel);
+    const text = formatValue(shown, "cell");
+    value.textContent = text === "–" ? text : `${text} ${unitLabel()}`;
+    const other = otherMode && raw !== null ? formatValue(toUnits(channel, raw, otherMode), "cell", otherMode) : "–";
+    second.textContent = other === "–" ? "" : `${other} ${unitLabel(otherMode)}`;
+    if (raw !== null && raw >= SATURATION_LEVEL) flag.textContent = "⚠ Saturated";
+    else flag.textContent = hasData() && !isCalibrated(channel) ? "Not calibrated" : "";
   }
 }
 
@@ -496,7 +566,7 @@ function updateScales() {
   const { min, max } = state.range;
   const set = (key, value) => {
     for (const el of document.querySelectorAll(`[data-scale="${key}"]`)) {
-      el.textContent = `${value.toFixed(2)} ${UNIT}`;
+      el.textContent = `${formatValue(value, "cell")} ${unitLabel()}`;
     }
   };
   set("low", min);
@@ -542,15 +612,14 @@ function buildSensorTable() {
 }
 
 function updateSensorTable() {
-  $("tableWindow").textContent = `In ${UNIT}. Statistics cover the last ${state.windowS} s.`;
+  $("tableWindow").textContent = `In ${unitLabel()}. Statistics cover the last ${state.windowS} s.`;
   for (const [channel, row] of tableRows) {
     const stat = state.stats.find((s) => s.channel === channel);
-    const now = currentValue(channel);
-    row.now.textContent = now === null ? "–" : now.toFixed(3);
-    row.mean.textContent = stat ? stat.mean.toFixed(3) : "–";
-    row.std.textContent = stat ? stat.std.toFixed(3) : "–";
-    row.min.textContent = stat ? stat.min.toFixed(3) : "–";
-    row.max.textContent = stat ? stat.max.toFixed(3) : "–";
+    row.now.textContent = formatValue(currentValue(channel));
+    row.mean.textContent = stat ? formatValue(stat.mean) : "–";
+    row.std.textContent = stat ? formatValue(stat.std) : "–";
+    row.min.textContent = stat ? formatValue(stat.min) : "–";
+    row.max.textContent = stat ? formatValue(stat.max) : "–";
   }
 }
 
@@ -558,6 +627,7 @@ function sideLoad(side) {
   let total = 0, moment = 0;
   side.channels.forEach((channel, i) => {
     const weight = Math.max(0, zeroed(channel, currentValue(channel)) - state.range.min);
+    if (!Number.isFinite(weight)) return; // uncalibrated sensors are left out in grams
     total += weight;
     moment += weight * ARC_POSITIONS_IN[i];
   });
@@ -586,23 +656,27 @@ function updateTiles() {
   } else {
     const percentA = Math.round((100 * a.total) / total);
     $("tileBalance").textContent = `${percentA}% / ${100 - percentA}%`;
-    $("tileBalanceSub").textContent = `${SIDES[0].name} / ${SIDES[1].name}`;
+    const partial = units.mode !== "V" && Object.keys(units.calibration).length < CHANNELS.length;
+    $("tileBalanceSub").textContent = `${SIDES[0].name} / ${SIDES[1].name}${partial ? ", calibrated sensors only" : ""}`;
     const formatCenter = (load) => {
       if (load.total < threshold) return "–";
-      return `${load.center > 0 ? "+" : "−"}${Math.abs(load.center).toFixed(2)} in`;
+      const center = Math.abs(load.center) < 0.005 ? 0 : load.center; // so it never shows −0.00
+      return `${center > 0 ? "+" : center < 0 ? "−" : ""}${Math.abs(center).toFixed(2)} in`;
     };
     $("tileCenterA").textContent = formatCenter(a);
     $("tileCenterB").textContent = formatCenter(b);
   }
 
-  let highest = CHANNELS[0];
+  let highest = null;
   const saturated = [];
   for (const channel of CHANNELS) {
     const value = currentValue(channel);
-    if (value > currentValue(highest)) highest = channel;
-    if (value >= SATURATION_LEVEL) saturated.push(`S${channel}`);
+    if (Number.isFinite(value) && (highest === null || value > currentValue(highest))) highest = channel;
+    if (currentRaw(channel) >= SATURATION_LEVEL) saturated.push(`S${channel}`);
   }
-  $("tilePeak").textContent = `S${highest}: ${currentValue(highest).toFixed(2)} ${UNIT}`;
+  $("tilePeak").textContent = highest === null
+    ? "No calibrated sensors"
+    : `S${highest}: ${formatValue(currentValue(highest), "cell")} ${unitLabel()}`;
   const note = $("tileSaturated");
   note.textContent = saturated.length ? `⚠ Saturated: ${saturated.join(", ")}` : "No sensors saturated";
   note.classList.toggle("saturated-note", saturated.length > 0);
@@ -630,7 +704,8 @@ function drawChart() {
   const plotWidth = width - PLOT.left - PLOT.right;
   const plotHeight = height - PLOT.top - PLOT.bottom;
   const { start, end } = chartWindow();
-  const yMax = Math.max(1, Math.ceil(state.range.max));
+  const yStep = niceStep(Math.max(state.range.max, 1e-6) / 5);
+  const yMax = Math.max(yStep, Math.ceil(state.range.max / yStep) * yStep);
   const xOf = (t) => PLOT.left + ((t - start) / (end - start)) * plotWidth;
   const yOf = (v) => PLOT.top + plotHeight * (1 - v / yMax);
 
@@ -639,15 +714,18 @@ function drawChart() {
 
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  for (let v = 0; v <= yMax; v++) {
+  const tickCount = Math.round(yMax / yStep);
+  for (let i = 0; i <= tickCount; i++) {
+    const v = i * yStep;
     const y = Math.round(yOf(v)) + 0.5;
-    ctx.strokeStyle = v === 0 ? tokens.axis : tokens.grid;
+    ctx.strokeStyle = i === 0 ? tokens.axis : tokens.grid;
     ctx.beginPath();
     ctx.moveTo(PLOT.left, y);
     ctx.lineTo(PLOT.left + plotWidth, y);
     ctx.stroke();
     ctx.fillStyle = tokens.muted;
-    ctx.fillText(v === yMax ? `${v} ${UNIT}` : `${v}`, PLOT.left - 6, y);
+    const label = Number(v.toPrecision(6)).toString();
+    ctx.fillText(i === tickCount ? `${label} ${unitLabel()}` : label, PLOT.left - 6, y);
   }
 
   ctx.textAlign = "center";
@@ -684,6 +762,7 @@ function drawChart() {
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
     for (const [channel, slot] of state.selected) {
+      if (!isCalibrated(channel)) continue;
       ctx.strokeStyle = tokens.series[slot];
       ctx.beginPath();
       drawDecimated(ctx, series, channel, first, xOf, yOf);
@@ -710,6 +789,13 @@ function drawChart() {
   }
 
   drawChartHover(xOf, yOf, plotHeight);
+}
+
+// Axis steps of 1, 2, or 5 times a power of ten, so labels stay round in volts and grams.
+function niceStep(rough) {
+  const power = 10 ** Math.floor(Math.log10(rough));
+  const scaled = rough / power;
+  return (scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10) * power;
 }
 
 // One pixel column can hold many samples, so keep each column's extremes and
@@ -767,11 +853,12 @@ function drawChartHover(xOf, yOf, plotHeight) {
   ctx.stroke();
 
   const rows = [...state.selected.entries()].sort((a, b) => a[0] - b[0]).map(([channel, slot]) => ({
-    value: `${series.value(index, channel).toFixed(3)} ${UNIT}`,
+    value: isCalibrated(channel) ? `${formatValue(series.value(index, channel))} ${unitLabel()}` : "Not calibrated",
     label: `S${channel}`,
     key: tokens.series[slot],
   }));
   for (const [channel, slot] of state.selected) {
+    if (!isCalibrated(channel)) continue;
     ctx.beginPath();
     ctx.arc(x, yOf(series.value(index, channel)), 4, 0, 2 * Math.PI);
     ctx.fillStyle = tokens.series[slot];
@@ -855,7 +942,7 @@ function ingestSample(sample) {
   }
   const row = new Float32Array(COUNT);
   for (const channel of CHANNELS) {
-    row[channel - 1] = toDisplayUnits(channel, sample[channel]);
+    row[channel - 1] = sample[channel];
   }
   live.push(timeMs, row);
   live.end = live.length;
@@ -947,8 +1034,8 @@ async function refreshPorts({ likelyOnly = false } = {}) {
       }
       addOption(simulated, simulatedLabel);
     };
-    fill(sensorSelect, "Choose a port�", listing.simulated_port, "Simulated Arduino (test data)");
-    fill(gripperSelect, "Choose a port�", listing.simulated_actuator_port, "Simulated gripper (test only)");
+    fill(sensorSelect, "Choose a port…", listing.simulated_port, "Simulated Arduino (test data)");
+    fill(gripperSelect, "Choose a port…", listing.simulated_actuator_port, "Simulated gripper (test only)");
 
     // never preselect a simulator, so test data can't be recorded by accident
     const restore = (select, previous, simulated) => {
@@ -970,7 +1057,7 @@ async function refreshPorts({ likelyOnly = false } = {}) {
 // COM numbers change between computers, so ask each port which Arduino it is.
 async function findArduinos(likelyOnly) {
   const note = $("detectStatus");
-  note.textContent = "Looking for your Arduinos�";
+  note.textContent = "Looking for your Arduinos…";
   try {
     const response = await fetch("/api/ports/identify", {
       method: "POST",
@@ -1103,7 +1190,7 @@ function parseRecording(text) {
     CHANNELS.forEach((channel, k) => {
       const value = Number(fields[columns[k]]);
       if (!Number.isFinite(value)) valid = false;
-      row[channel - 1] = toDisplayUnits(channel, value);
+      row[channel - 1] = value;
     });
     if (!valid) continue;
     series.push(timeMs, row);
@@ -1224,8 +1311,45 @@ function applyRangeInputs() {
     return;
   }
   state.range = { min, max };
+  state.ranges[units.mode] = { min, max };
   updateScales();
   invalidate();
+}
+
+function setUnits(mode) {
+  units.mode = mode;
+  state.range = { ...state.ranges[mode] };
+  $("rangeMin").value = state.range.min;
+  $("rangeMax").value = state.range.max;
+  $("rangeUnit").textContent = unitLabel();
+  $("unitNote").hidden = !(mode === "N" || mode === "MPa");
+  // both are in the old unit, so they'd be meaningless after switching
+  resetPeak();
+  state.baseline = null;
+  updateZeroButton();
+  syncSelection();
+  updateScales();
+  invalidate();
+  try {
+    localStorage.setItem("flexiforce-units", mode);
+  } catch {
+    // only a convenience, so it's fine if storage is blocked
+  }
+}
+
+function applyCalibrations(sensorsMap) {
+  units.calibration = sensorsMap || {};
+  const count = Object.keys(units.calibration).length;
+  for (const option of $("unitSelect").options) {
+    if (option.value === "V") continue;
+    option.textContent = count < CHANNELS.length
+      ? `${option.dataset.label} (${count} of ${CHANNELS.length} calibrated)`
+      : option.dataset.label;
+  }
+  $("unitNote").textContent =
+    `Pressure is each sensor's force spread evenly over its ${SENSING_DIAMETER_MM} mm sensing circle `
+    + `(${SENSING_AREA_MM2.toFixed(2)} mm²), so it's the average over that circle.`;
+  setUnits(units.mode);
 }
 
 function bindControls() {
@@ -1275,6 +1399,8 @@ function bindControls() {
   for (const button of document.querySelectorAll("[data-view]")) {
     button.addEventListener("click", () => cylinder.setView(VIEW_PRESETS[button.dataset.view]));
   }
+
+  $("unitSelect").addEventListener("change", (event) => setUnits(event.target.value));
 
   $("windowSelect").addEventListener("change", (event) => {
     state.windowS = Number(event.target.value);
@@ -1329,6 +1455,52 @@ const gripper = initGripper({
   onResult: refreshRecordings,
 });
 
+async function request(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `Request failed (${response.status}).`);
+  return payload;
+}
+
+const calibration = initCalibration({
+  sensors,
+  request,
+  latestLive: (channel) => (state.status && state.status.state === "live" && live.length > 0
+    ? live.raw(live.length - 1, channel)
+    : null),
+  liveSince: {
+    now: () => (live.length > 0 ? live.time[live.length - 1] : 0),
+    values: (channel, fromMs) => {
+      const values = [];
+      for (let i = live.lowerBound(fromMs + 0.001, live.length); i < live.length; i++) values.push(live.raw(i, channel));
+      return values;
+    },
+  },
+  onSaved: applyCalibrations,
+  focusSensor: (channel) => {
+    if (!state.selected.has(channel)) toggleSensor(channel);
+  },
+  showError: (message) => {
+    state.localError = message;
+    renderBanner();
+  },
+});
+
+async function loadCalibrations() {
+  try {
+    const snapshot = await (await fetch("/api/calibration")).json();
+    calibration.load(snapshot);
+    applyCalibrations(snapshot.sensors);
+  } catch (error) {
+    state.localError = "Couldn't load the sensor calibrations.";
+    renderBanner();
+  }
+}
+
 // ------------------------------- main loop --------------------------------
 
 let lastDraw = 0;
@@ -1373,9 +1545,15 @@ function init() {
   bindControls();
   bindChartHover();
 
-  $("rangeMin").value = state.range.min;
-  $("rangeMax").value = state.range.max;
-  $("rangeUnit").textContent = UNIT;
+  let savedUnits = null;
+  try {
+    savedUnits = localStorage.getItem("flexiforce-units");
+  } catch {
+    // only a convenience, so it's fine if storage is blocked
+  }
+  if (["force", "N", "MPa"].includes(savedUnits)) $("unitSelect").value = savedUnits;
+  setUnits($("unitSelect").value);
+  loadCalibrations();
 
   // start with each side's middle sensor on the chart
   for (const side of SIDES) toggleSensor(side.channels[Math.floor(side.channels.length / 2)]);

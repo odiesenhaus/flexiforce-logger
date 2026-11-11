@@ -20,6 +20,7 @@ An Arduino Mega 2560 samples ten Tekscan FlexiForce sensors at 100 Hz and stream
 | `live_view.py` | Real-time scrolling graph straight from the serial port, with each channel's mean and standard deviation over the visible window. Saves nothing to disk. |
 | `dashboard.py`, `dashboard/` | Local web dashboard: live 3D cylinder and heat grid, one-click recording, and replay of saved runs. |
 | `gripper_test.py` | Runs automated gripper tests for the dashboard, then splits each recording into trials and computes statistics. |
+| `calibration.py` | Fits and saves each sensor's volts-to-grams calibration for the dashboard. |
 
 ## Setup
 
@@ -88,11 +89,24 @@ This opens http://localhost:8765 and only needs pyserial, so it works without in
 - **Auto-stop:** ends a recording after a set number of seconds.
 - **Replay:** plays any saved run through the same views, including older `collect_data.py` files.
 
-The sensor layout, channel order, color range, and the spot for force calibration are all in `dashboard/config.js`.
+The sensor layout, channel order, and color ranges are all in `dashboard/config.js`.
+
+## Calibrating to grams
+
+The **Sensor calibration** panel walks through one sensor at a time, following Tekscan's procedure:
+
+1. **Condition the sensor (recommended):** load it with 500 g 3–5 times, about 10 s each.
+2. **Set the sensitivity:** with 500 g on, turn the sensor's feedback potentiometer until the reading just reaches the top, about 4.9–5.0 V.
+3. **Capture the readings:** take one with no load, then one with each weight (100, 200, and 500 g, or any other weight). Each capture averages a few seconds of data.
+4. **Fit and check:** the page fits a straight line, `volts = slope × grams + intercept`, and shows how far each point is from it. Then save it, put the weights back on to check the reading, and move on to the next sensor.
+
+Any reading that saturates (4.98 V or more) is left out of the fit, since it only shows that the load is at least that much. Saved calibrations go in `calibration.json` next to the recordings. Recalibrating or removing a sensor keeps the old values in that file's history.
+
+Use **Show** to see calibrated sensors in grams, newtons, or pressure (MPa) everywhere on the page; sensors that aren't calibrated show "–". Newtons use g = 9.80665 m/s². Pressure is each sensor's force divided by its 3.8 mm sensing circle (11.34 mm²), so it's the average over that circle, not the peak contact pressure. In newtons or MPa, each heat grid cell shows both. Recordings keep the raw volts and, for calibrated sensors, also save `S#_N` and `S#_MPa` columns. Those use the calibration from when the recording started, and a `_calibration.json` file saved alongside shows exactly which one. Uncalibrated sensors' N and MPa columns are left blank. On the page, replays use whichever calibration is current. If you turn a sensor's potentiometer, recalibrate it.
 
 ## Automated gripper test
 
-With the actuator Arduino plugged in as well, **Start test** runs the gripper through a set number of trials while recording. It defaults to 4 trials of 10 s closed and 10 s open, after 5 s to open the gripper and get ready. The actuator Arduino needs `actuator_control/actuator_control.ino`, which accepts `o` (open), `c` (close), and `?` (identify) over serial at 9600 baud. Its physical button still works, and the open and closed positions are still set only in that sketch.
+With the actuator Arduino plugged in as well, **Start test** runs the gripper through a set number of trials while recording. It defaults to 4 trials of 10 s closed and 10 s open, after 5 s to open the gripper and get ready. The actuator Arduino can be an Uno or a native-USB board like the M0 Pro or Zero (on either of its USB ports). It needs `actuator_control/actuator_control.ino`, which accepts `o` (open), `c` (close), and `?` (identify) over serial at 9600 baud. Its physical button still works, and the open and closed positions are still set only in that sketch.
 
 Each test saves three files:
 
@@ -102,6 +116,7 @@ Each test saves three files:
 | `flexiforce_<time>_<name>_trials.csv` | Only the complete trials, labeled by `trial`, `phase` (closed or open), and `trial_time_s` |
 | `flexiforce_<time>_<name>_summary.csv` | Mean, standard deviation, min, max, and % saturated for each phase, sensor, and trial |
 
+- **Units:** with calibrated sensors, every file also has newtons and MPa (`S#_N`, `S#_MPa` columns, and `mean_N`, `std_N`, `mean_MPa`, and so on in the summary), and the results table can switch between V, N, and MPa. Volts are always kept.
 - **Timing:** each phase is timed from the moment its command is sent, so the closed time includes the time spent moving.
 - **Statistics:** the first few seconds of each phase (**Ignore first**, default 4 s) are left out of the statistics because the gripper is still moving. Those rows stay in the trials file with `in_stats` set to 0.
 - **The `all` rows in the summary:** the mean is the average of the trial means, and the standard deviation is between those trial means.
