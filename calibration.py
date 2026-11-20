@@ -120,25 +120,46 @@ class CalibrationStore:
     def __init__(self, data_dir):
         self.path = os.path.join(data_dir, FILE_NAME)
         self.lock = threading.Lock()
+        self.mtime = None
+        self._load()
+
+    def _load(self):
         self.load_error = None
         self.data = {"version": 1, "unit": "g", "sensors": {}, "history": []}
-        if os.path.exists(self.path):
-            try:
-                with open(self.path) as f:
-                    loaded = json.load(f)
-                if not isinstance(loaded.get("sensors"), dict):
-                    raise ValueError("no sensors section")
-                self.data.update(loaded)
-            except (OSError, ValueError, AttributeError) as e:
-                # refusing to save keeps a damaged file from being overwritten and lost
-                self.load_error = f"{FILE_NAME} couldn't be read ({e}). Fix or move it to save calibrations."
+        if not os.path.exists(self.path):
+            self.mtime = None
+            return
+        try:
+            self.mtime = os.path.getmtime(self.path)
+            with open(self.path) as f:
+                loaded = json.load(f)
+            if not isinstance(loaded.get("sensors"), dict):
+                raise ValueError("no sensors section")
+            self.data.update(loaded)
+        except (OSError, ValueError, AttributeError) as e:
+            # refusing to save keeps a damaged file from being overwritten and lost
+            self.load_error = f"{FILE_NAME} couldn't be read ({e}). Fix or move it to save calibrations."
+
+    def _refresh(self):
+        """
+        Picks up changes made outside this dashboard, like a git pull or a calibration
+        saved from another copy of it, so a recording never uses an out-of-date one.
+        """
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            mtime = None
+        if mtime != self.mtime:
+            self._load()
 
     def conversion(self):
         with self.lock:
+            self._refresh()
             return Conversion(json.loads(json.dumps(self.data["sensors"])))  # a copy, frozen for one recording
 
     def snapshot(self):
         with self.lock:
+            self._refresh()
             return {"sensors": self.data["sensors"], "unit": self.data["unit"], "error": self.load_error,
                     "path": self.path}
 
@@ -148,6 +169,9 @@ class CalibrationStore:
         entry["channel"] = channel
         entry["calibrated_at"] = datetime.now().isoformat(timespec="seconds")
         with self.lock:
+            self._refresh()  # so a save never undoes a change made elsewhere
+            if self.load_error:
+                raise ValueError(self.load_error)
             previous = self.data["sensors"].get(str(channel))
             if previous:
                 self.data["history"].append(previous)
@@ -158,6 +182,7 @@ class CalibrationStore:
     def clear(self, channel):
         channel = self._check_channel(channel)
         with self.lock:
+            self._refresh()
             previous = self.data["sensors"].pop(str(channel), None)
             if previous:
                 self.data["history"].append(previous)
@@ -180,3 +205,4 @@ class CalibrationStore:
         with open(temporary, "w") as f:
             json.dump(self.data, f, indent=2)
         os.replace(temporary, self.path)
+        self.mtime = os.path.getmtime(self.path)  # our own save isn't an outside change

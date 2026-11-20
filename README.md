@@ -21,6 +21,7 @@ An Arduino Mega 2560 samples ten Tekscan FlexiForce sensors at 100 Hz and stream
 | `dashboard.py`, `dashboard/` | Local web dashboard: live 3D cylinder and heat grid, one-click recording, and replay of saved runs. |
 | `gripper_test.py` | Runs automated gripper tests for the dashboard, then splits each recording into trials and computes statistics. |
 | `calibration.py` | Fits and saves each sensor's volts-to-grams calibration for the dashboard. |
+| `compare_tests.py` | Compares several gripper tests and makes report figures of the grip force distribution. |
 
 ## Setup
 
@@ -127,6 +128,21 @@ Pressing the physical button during a normal recording is marked in the file aut
 ### Serial ports
 
 COM numbers differ between computers and can change when a board moves to another USB socket, so nothing in the code depends on them. **Find Arduinos** asks each USB serial port which board it is and fills in both dropdowns, and it also runs when the page loads. Each port can only be used by one program at a time, so close the Arduino IDE's Serial Monitor before connecting, and press **Disconnect** before uploading a sketch.
+
+## Comparing tests
+
+Put each gripper test's files in its own subfolder (for example `Fin1_Test`, `Fin2_Test`), then:
+
+```bash
+python compare_tests.py "Test 2 - Recalibrated Sensors" --calibration calibration.json
+```
+
+This writes figures (PNG and PDF) and summary CSVs into a `figures` folder inside the test folder:
+- **Total grip force:** each test's total, split by side, with the spread between trials.
+- **Force profiles:** force along each side's arc, one panel per test.
+- **Force maps:** heat grids of every test side by side.
+
+Each sensor's force is its closed-phase reading minus the open-phase reading that follows, which removes its offset at rest. Saturated readings are marked as lower bounds. `--calibration` recalculates newtons from the recorded volts. Without it, the saved newtons are used, and the script warns when a test was recorded with a different calibration.
 
 ## Notes
 
